@@ -11,6 +11,7 @@
 #include <glob.h>
 #include <poll.h>
 #include <string>
+#include <sys/inotify.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -20,12 +21,6 @@
 static volatile sig_atomic_t running = 1;
 
 static void sig_handler(int) { running = 0; }
-
-// Return "sudo" if we have a terminal (password prompt works),
-// "sudo -n" otherwise (fails fast with no tty).
-static const char* sudo_cmd() {
-    return isatty(STDIN_FILENO) ? "sudo" : "sudo -n";
-}
 
 static bool module_loaded() {
     struct stat st;
@@ -43,6 +38,10 @@ static void print_sudo_help() {
         "---\n\n");
 }
 
+static const char* sudo_cmd() {
+    return isatty(STDIN_FILENO) ? "sudo" : "sudo -n";
+}
+
 static bool load_module() {
     fprintf(stderr, "v4l2loopback module not loaded, loading...\n");
     std::string cmd = std::string(sudo_cmd()) +
@@ -50,8 +49,7 @@ static bool load_module() {
     int ret = system(cmd.c_str());
     if (ret != 0 && !module_loaded()) {
         fprintf(stderr,
-            "Failed to load v4l2loopback module"
-            " (sudo modprobe returned %d).\n"
+            "Failed to load v4l2loopback module (exit %d).\n"
             "Is the akmod-v4l2loopback package installed?\n", ret);
         print_sudo_help();
         return false;
@@ -67,11 +65,9 @@ static bool load_module() {
 static std::string find_device_by_card(const char* card_name) {
     glob_t gl;
     if (glob("/dev/video*", 0, nullptr, &gl) != 0) return "";
-
     std::string result;
     for (size_t i = 0; i < gl.gl_pathc; i++) {
         V4L2Device dev;
-        // Try opening as OUTPUT first (for loopback), then CAPTURE
         bool opened = dev.open(gl.gl_pathv[i], V4L2_BUF_TYPE_VIDEO_OUTPUT);
         if (!opened)
             opened = dev.open(gl.gl_pathv[i], V4L2_BUF_TYPE_VIDEO_CAPTURE);
@@ -94,17 +90,15 @@ static std::string create_loopback_device() {
         " v4l2loopback-ctl add -n WebCamProxy -x 1 -b 4 2>/dev/null";
     int ret = system(cmd.c_str());
     if (ret != 0) {
-        fprintf(stderr, "v4l2loopback-ctl add failed (exit code %d).\n",
+        fprintf(stderr, "v4l2loopback-ctl add failed (exit %d).\n",
                 WEXITSTATUS(ret));
         return "";
     }
-
     for (int attempt = 0; attempt < 10; attempt++) {
         if (attempt > 0) usleep(100000);
         std::string dev = find_device_by_card("WebCamProxy");
         if (!dev.empty()) return dev;
     }
-
     return "";
 }
 
@@ -119,7 +113,6 @@ static std::string find_fallback_loopback(const std::string& cam_path) {
     std::string result;
     glob_t gl;
     if (glob("/dev/video*", 0, nullptr, &gl) != 0) return "";
-
     for (size_t i = 0; i < gl.gl_pathc; i++) {
         if (gl.gl_pathv[i] == cam_path) continue;
         V4L2Device dev;
@@ -138,6 +131,25 @@ static std::string find_fallback_loopback(const std::string& cam_path) {
     return result;
 }
 
+static bool has_other_opener(const std::string& path) {
+    pid_t my_pid = getpid();
+    glob_t gl;
+    if (glob("/proc/*/fd/*", GLOB_NOSORT, nullptr, &gl) != 0) return false;
+    bool found = false;
+    for (size_t i = 0; i < gl.gl_pathc; i++) {
+        char buf[256];
+        ssize_t len = readlink(gl.gl_pathv[i], buf, sizeof(buf) - 1);
+        if (len < 0) continue;
+        buf[len] = '\0';
+        if (path == buf) {
+            pid_t pid = atoi(gl.gl_pathv[i] + 6);
+            if (pid > 0 && pid != my_pid) { found = true; break; }
+        }
+    }
+    globfree(&gl);
+    return found;
+}
+
 int main() {
     if (!module_loaded() && !load_module()) return 1;
 
@@ -147,18 +159,15 @@ int main() {
         fprintf(stderr, "No /dev/video* devices found.\n");
         return 1;
     }
-
     std::string cam_path;
     for (size_t i = 0; i < gl.gl_pathc; i++) {
         V4L2Device dev;
         if (!dev.open(gl.gl_pathv[i], V4L2_BUF_TYPE_VIDEO_CAPTURE)) continue;
         if (!dev.hasCapture() || !dev.hasStreaming()) {
-            dev.close();
-            continue;
+            dev.close(); continue;
         }
         if (dev.driver().find("loopback") != std::string::npos) {
-            dev.close();
-            continue;
+            dev.close(); continue;
         }
         cam_path = gl.gl_pathv[i];
         fprintf(stderr, "Real webcam: %s (%s)\n",
@@ -167,37 +176,30 @@ int main() {
         break;
     }
     globfree(&gl);
-
     if (cam_path.empty()) {
-        fprintf(stderr, "No real webcam found"
-                " (V4L2_CAP_VIDEO_CAPTURE + V4L2_CAP_STREAMING).\n");
+        fprintf(stderr, "No real webcam found.\n");
         return 1;
     }
 
     // --- Find or create loopback device ---
     bool created = false;
     std::string out_path;
-
-    // Remove any stale VirtualCam device from a previous run
     std::string stale = find_device_by_card("WebCamProxy");
     if (!stale.empty()) {
         fprintf(stderr, "Removing stale WebCamProxy device: %s\n",
                 stale.c_str());
         delete_loopback_device(stale);
     }
-
     out_path = create_loopback_device();
     if (!out_path.empty()) {
         created = true;
         fprintf(stderr, "Created loopback device: %s\n", out_path.c_str());
     } else {
-        fprintf(stderr, "Device creation failed; searching for existing"
-                " loopback devices...\n");
-        fprintf(stderr, "WARNING: Some apps (Cheese, Firefox) may not"
-                " detect a device with exclusive_caps=1.\n");
+        fprintf(stderr, "Device creation failed; falling back...\n");
+        fprintf(stderr, "WARNING: Some apps may not detect the fallback"
+                " device.\n");
         out_path = find_fallback_loopback(cam_path);
     }
-
     if (out_path.empty()) {
         fprintf(stderr, "No loopback output device available.\n");
         return 1;
@@ -205,162 +207,281 @@ int main() {
 
     print_sudo_help();
 
-    // --- Streaming block ---
-    V4L2Device cam, out;
-    bool stream_ok = false;
-
-    do {
-        if (!cam.open(cam_path.c_str(), V4L2_BUF_TYPE_VIDEO_CAPTURE)) {
-            fprintf(stderr, "Failed to open camera %s: %s\n",
-                    cam_path.c_str(), strerror(errno));
-            break;
+    // --- Negotiate camera format (open/close camera briefly) ---
+    uint32_t width = 640, height = 480;
+    uint32_t pixfmt, frame_size;
+    {
+        V4L2Device cam_tmp;
+        if (!cam_tmp.open(cam_path.c_str(), V4L2_BUF_TYPE_VIDEO_CAPTURE)) {
+            fprintf(stderr, "Failed to probe camera: %s\n", strerror(errno));
+            goto cleanup_device;
         }
-
-        uint32_t pixfmt = V4L2_PIX_FMT_YUYV;
-        uint32_t width = 640, height = 480;
-        if (!cam.setFormat(pixfmt, width, height)) {
-            fprintf(stderr, "Failed to set format on camera\n");
-            break;
+        pixfmt = V4L2_PIX_FMT_YUYV;
+        if (!cam_tmp.setFormat(pixfmt, width, height)) {
+            fprintf(stderr, "Camera format negotiation failed\n");
+            goto cleanup_device;
         }
         if (pixfmt != V4L2_PIX_FMT_YUYV) {
-            fprintf(stderr, "Camera does not support YUYV (got: %c%c%c%c)\n",
-                    static_cast<char>(pixfmt & 0xFF),
-                    static_cast<char>((pixfmt >> 8) & 0xFF),
-                    static_cast<char>((pixfmt >> 16) & 0xFF),
-                    static_cast<char>((pixfmt >> 24) & 0xFF));
-            break;
+            fprintf(stderr, "Camera does not support YUYV\n");
+            goto cleanup_device;
         }
-
-        uint32_t frame_size = cam.frameSize();
+        frame_size = cam_tmp.frameSize();
         fprintf(stderr, "Format: YUYV %ux%u (%u bytes/frame)\n",
                 width, height, frame_size);
+    }
+
+    // --- Everything below uses these initialized variables ---
+    {
+        V4L2Device out;
+        std::vector<uint8_t> rotated_frame(frame_size);
+        std::vector<uint8_t> blank_frame(frame_size, 0);
+        // Prepare black frame
+        for (size_t i = 0; i < frame_size; i += 4) {
+            blank_frame[i]     = 16;
+            blank_frame[i + 1] = 128;
+            blank_frame[i + 2] = 16;
+            blank_frame[i + 3] = 128;
+        }
+        time_t last_status = time(nullptr);
+        bool setup_ok = false;
+        int inotify_fd = -1;
+        int inotify_wd = -1;
+        int open_count = 1; // our own open
+        bool use_inotify = false;
 
         if (!out.open(out_path.c_str(), V4L2_BUF_TYPE_VIDEO_OUTPUT)) {
             fprintf(stderr, "Failed to open output device %s: %s\n",
                     out_path.c_str(), strerror(errno));
-            break;
+            goto out_done;
         }
-
-        uint32_t out_pixfmt = pixfmt;
-        uint32_t out_w = width, out_h = height;
-        if (!out.setFormat(out_pixfmt, out_w, out_h)) {
-            fprintf(stderr, "Failed to set format on output device\n");
-            break;
+        {
+            uint32_t opf = pixfmt, ow = width, oh = height;
+            if (!out.setFormat(opf, ow, oh) ||
+                opf != V4L2_PIX_FMT_YUYV || ow != width || oh != height) {
+                fprintf(stderr, "Output device rejected format\n");
+                goto out_done;
+            }
         }
-        if (out_pixfmt != V4L2_PIX_FMT_YUYV || out_w != width
-            || out_h != height) {
-            fprintf(stderr, "Output device rejected YUYV %ux%u format\n",
-                    width, height);
-            break;
-        }
-
         {
             v4l2_control ctrl;
             std::memset(&ctrl, 0, sizeof(ctrl));
             ctrl.id = 0x0098f900;
             ctrl.value = 1;
-            if (ioctl(out.fd(), VIDIOC_S_CTRL, &ctrl) < 0) {
-                fprintf(stderr, "Warning: could not set keep_format: %s\n",
+            ioctl(out.fd(), VIDIOC_S_CTRL, &ctrl);
+        }
+        {
+            int fl = fcntl(out.fd(), F_GETFL, 0);
+            fcntl(out.fd(), F_SETFL, fl | O_NONBLOCK);
+        }
+
+        // Set up inotify to detect consumer opens/closes
+        inotify_fd = inotify_init1(IN_NONBLOCK);
+        if (inotify_fd < 0) {
+            fprintf(stderr, "inotify_init1 failed: %s\n", strerror(errno));
+        } else {
+            inotify_wd = inotify_add_watch(inotify_fd, out_path.c_str(),
+                                            IN_OPEN | IN_CLOSE);
+            if (inotify_wd < 0) {
+                fprintf(stderr, "inotify_add_watch failed: %s\n",
                         strerror(errno));
+                close(inotify_fd);
+                inotify_fd = -1;
             }
         }
+        use_inotify = (inotify_fd >= 0);
 
-        int out_flags = fcntl(out.fd(), F_GETFL, 0);
-        fcntl(out.fd(), F_SETFL, out_flags | O_NONBLOCK);
-
-        const uint32_t NUM_BUFFERS = 4;
-        if (!cam.initBuffers(NUM_BUFFERS)) {
-            fprintf(stderr, "Failed to init capture buffers\n");
-            break;
-        }
-
-        if (!cam.startStreaming()) {
-            fprintf(stderr, "Failed to start capture streaming\n");
-            break;
-        }
-
-        fprintf(stderr, "Streaming. Press Ctrl+C to stop.\n");
-
-        struct sigaction sa;
-        std::memset(&sa, 0, sizeof(sa));
-        sa.sa_handler = sig_handler;
-        sigaction(SIGINT, &sa, nullptr);
-        sigaction(SIGTERM, &sa, nullptr);
-
-        std::vector<uint8_t> rotated_frame(frame_size);
-        bool have_frame = false;
-        time_t last_status = time(nullptr);
-        uint64_t cap_count = 0, out_count = 0, out_skip = 0;
+        signal(SIGINT, sig_handler);
+        signal(SIGTERM, sig_handler);
         setvbuf(stderr, nullptr, _IONBF, 0);
+        setup_ok = true;
 
-        stream_ok = true;
+        fprintf(stderr, "Waiting for consumer to connect"
+                " to %s...\n", out_path.c_str());
 
         while (running) {
-            struct pollfd fds[1];
-            fds[0].fd = cam.fd();
-            fds[0].events = POLLIN;
-
-            int ret = poll(fds, 1, 1000);
-            if (ret < 0) {
-                if (errno == EINTR) continue;
-                perror("poll");
-                break;
-            }
-
-            {
-                time_t now = time(nullptr);
-                if (now != last_status) {
-                    fprintf(stderr, "[status] cap=%lu out=%lu skip=%lu "
-                            "have_frame=%d\n",
-                            cap_count, out_count, out_skip, have_frame);
-                    last_status = now;
+            // --- Idle: wait for consumer ---
+            fprintf(stderr, "[idle] camera closed, waiting...\n");
+            if (use_inotify) {
+                while (running && open_count <= 1) {
+                    struct pollfd pfd;
+                    pfd.fd = inotify_fd;
+                    pfd.events = POLLIN;
+                    int ret = poll(&pfd, 1, 1000);
+                    if (ret < 0) { if (errno == EINTR) continue; break; }
+                    if (ret == 0) {
+                        write(out.fd(), blank_frame.data(), frame_size);
+                        continue;
+                    }
+                    if (pfd.revents & POLLIN) {
+                        char buf[4096];
+                        ssize_t len = read(inotify_fd, buf, sizeof(buf));
+                        for (char *p = buf; p < buf + len; ) {
+                            auto* ev = (struct inotify_event*)p;
+                             if (ev->mask & IN_OPEN)  open_count++;
+                             if (ev->mask & IN_CLOSE)  open_count--;
+                             p += sizeof(*ev) + ev->len;
+                         }
+                         if (open_count < 1) open_count = 1;
+                     }
+                 }
+             } else {
+                // Fallback: periodic polling via /proc
+                while (running && !has_other_opener(out_path)) {
+                    write(out.fd(), blank_frame.data(), frame_size);
+                    usleep(1000000);
                 }
             }
-            if (ret == 0) continue;
+            if (!running) break;
 
-            if (fds[0].revents & POLLIN) {
-                size_t idx, bytesused;
-                if (cam.dequeueBuffer(idx, bytesused)) {
-                    if (idx >= cam.numBuffers()) {
+            // --- Consumer detected — open camera ---
+            fprintf(stderr, "[active] consumer detected, opening camera...\n");
+            V4L2Device cam;
+            bool cam_ok = false;
+            do {
+                if (!cam.open(cam_path.c_str(),
+                              V4L2_BUF_TYPE_VIDEO_CAPTURE)) {
+                    fprintf(stderr, "Failed to open camera: %s\n",
+                            strerror(errno));
+                    break;
+                }
+                uint32_t pf = V4L2_PIX_FMT_YUYV;
+                uint32_t w = width, h = height;
+                if (!cam.setFormat(pf, w, h) ||
+                    pf != V4L2_PIX_FMT_YUYV) {
+                    fprintf(stderr, "Failed to set camera format\n");
+                    break;
+                }
+                if (!cam.initBuffers(4)) {
+                    fprintf(stderr, "Failed to init capture buffers\n");
+                    break;
+                }
+                if (!cam.startStreaming()) {
+                    fprintf(stderr, "Failed to start capture\n");
+                    break;
+                }
+                cam_ok = true;
+            } while (false);
+            if (!cam_ok) { cam.close(); continue; }
+
+            fprintf(stderr, "Camera streaming to %s."
+                    " Press Ctrl+C to stop.\n", out_path.c_str());
+            last_status = time(nullptr);
+            uint64_t cap_count = 0, out_count = 0, out_skip = 0;
+
+            while (running) {
+                struct pollfd fds[2];
+                int nfds = 0;
+                fds[nfds].fd = cam.fd();
+                fds[nfds].events = POLLIN;
+                nfds++;
+                if (use_inotify) {
+                    fds[nfds].fd = inotify_fd;
+                    fds[nfds].events = POLLIN;
+                    nfds++;
+                }
+
+                int ret = poll(fds, nfds, 200);
+                if (ret < 0) {
+                    if (errno == EINTR) continue;
+                    perror("poll");
+                    break;
+                }
+
+                {
+                    time_t now = time(nullptr);
+                    if (now != last_status) {
                         fprintf(stderr,
-                                "Capture dequeue: bad index %zu\n", idx);
-                        break;
+                                "[active] cap=%lu out=%lu skip=%lu"
+                                " openers=%d\n",
+                                cap_count, out_count, out_skip,
+                                open_count);
+                        last_status = now;
                     }
-                    rotate_yuyv_180(
-                        static_cast<const uint8_t*>(
-                            cam.buffer(idx).start),
-                        rotated_frame.data(), width, height);
-                    have_frame = true;
-                    cap_count++;
-                    cam.enqueueBuffer(idx, bytesused);
+                }
 
-                    ssize_t written = write(out.fd(), rotated_frame.data(),
-                                            frame_size);
-                    if (written == static_cast<ssize_t>(frame_size)) {
-                        out_count++;
-                    } else if (written < 0 && errno != EAGAIN) {
-                        fprintf(stderr, "Output write error: %s\n",
-                                strerror(errno));
-                        break;
-                    } else {
-                        out_skip++;
+                // Process inotify events
+                if (use_inotify && (fds[1].revents & POLLIN)) {
+                    char buf[4096];
+                    ssize_t len = read(inotify_fd, buf, sizeof(buf));
+                    for (char *p = buf; p < buf + len; ) {
+                        auto* ev = (struct inotify_event*)p;
+                        if (ev->mask & IN_OPEN)  open_count++;
+                        if (ev->mask & IN_CLOSE)  open_count--;
+                        p += sizeof(*ev) + ev->len;
                     }
+                    if (open_count < 1) open_count = 1;
+                    if (open_count <= 1) {
+                        fprintf(stderr,
+                                "[active] consumer gone, closing camera\n");
+                        break;
+                    }
+                }
+                if (!use_inotify) {
+                    // Fallback: check every ~5s
+                    static int check_ctr = 0;
+                    if (++check_ctr >= 25) {
+                        check_ctr = 0;
+                        if (!has_other_opener(out_path)) {
+                            fprintf(stderr,
+                                    "[active] consumer gone, closing camera\n");
+                            break;
+                        }
+                    }
+                }
+
+                if (ret == 0) continue;
+
+                // Camera has a new frame
+                if (fds[0].revents & POLLIN) {
+                    size_t idx, bytesused;
+                    if (cam.dequeueBuffer(idx, bytesused)) {
+                        if (idx >= cam.numBuffers()) {
+                            fprintf(stderr,
+                                    "Bad capture index %zu\n", idx);
+                            break;
+                        }
+                        rotate_yuyv_180(
+                            static_cast<const uint8_t*>(
+                                cam.buffer(idx).start),
+                            rotated_frame.data(), width, height);
+                        cap_count++;
+                        cam.enqueueBuffer(idx, bytesused);
+
+                        ssize_t written = write(out.fd(),
+                                                rotated_frame.data(),
+                                                frame_size);
+                        if (written == static_cast<ssize_t>(frame_size)) {
+                            out_count++;
+                        } else if (written < 0 && errno != EAGAIN) {
+                            fprintf(stderr, "Output write error: %s\n",
+                                    strerror(errno));
+                            break;
+                        } else {
+                            out_skip++;
+                        }
+                    }
+                }
+
+                if (fds[0].revents & (POLLERR | POLLHUP)) {
+                    fprintf(stderr, "Capture device error\n");
+                    break;
                 }
             }
 
-            if (fds[0].revents & (POLLERR | POLLHUP)) {
-                fprintf(stderr, "Capture device error/hangup\n");
-                break;
-            }
+            fprintf(stderr, "[active] closing camera...\n");
+            cam.stopStreaming();
+            cam.close();
         }
 
         fprintf(stderr, "Shutting down...\n");
-    } while (false);
+    out_done:
+        if (inotify_wd >= 0) inotify_rm_watch(inotify_fd, inotify_wd);
+        if (inotify_fd >= 0) close(inotify_fd);
+        out.close();
+        (void)setup_ok;
+    }
 
-    cam.stopStreaming();
-    cam.close();
-    out.close();
-
+cleanup_device:
     if (created) {
         fprintf(stderr, "Removing virtual camera device %s...\n",
                 out_path.c_str());
