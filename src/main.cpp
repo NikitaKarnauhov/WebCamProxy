@@ -21,8 +21,9 @@
 
 static volatile sig_atomic_t running = 1;
 
-static std::string opt_source;   // --source /dev/videoN or card name
+static std::string opt_source;   // --source
 static std::string opt_name = "WebCamProxy";  // --name
+static int opt_rotate = 180;     // --rotate
 
 static void sig_handler(int) { running = 0; }
 
@@ -91,7 +92,8 @@ static std::string create_loopback_device() {
     fprintf(stderr, "Creating new v4l2loopback device"
             " (sudo v4l2loopback-ctl add)...\n");
     std::string cmd = std::string(sudo_cmd()) +
-        " v4l2loopback-ctl add -n " + opt_name + " -x 1 -b 4 2>/dev/null";
+        " v4l2loopback-ctl add -n " + opt_name +
+        " -x 1 -b 4 -w 1920 -h 1920 2>/dev/null";
     int ret = system(cmd.c_str());
     if (ret != 0) {
         fprintf(stderr, "v4l2loopback-ctl add failed (exit %d).\n",
@@ -158,21 +160,33 @@ int main(int argc, char** argv) {
     static struct option long_opts[] = {
         {"source", required_argument, nullptr, 's'},
         {"name",   required_argument, nullptr, 'n'},
+        {"rotate", required_argument, nullptr, 'r'},
         {"help",   no_argument,       nullptr, 'h'},
         {nullptr, 0, nullptr, 0}
     };
     int c;
-    while ((c = getopt_long(argc, argv, "s:n:h", long_opts, nullptr)) != -1) {
+    while ((c = getopt_long(argc, argv, "s:n:r:h", long_opts, nullptr)) != -1) {
         switch (c) {
         case 's': opt_source = optarg; break;
         case 'n': opt_name   = optarg; break;
+        case 'r':
+            opt_rotate = atoi(optarg);
+            if (opt_rotate != 0 && opt_rotate != 90 &&
+                opt_rotate != 180 && opt_rotate != 270) {
+                fprintf(stderr, "Invalid --rotate angle: %s"
+                        " (must be 0, 90, 180, or 270)\n", optarg);
+                return 1;
+            }
+            break;
         case 'h':
             fprintf(stderr,
-                "Usage: %s [--source DEVICE] [--name NAME]\n"
+                "Usage: %s [--source DEVICE] [--name NAME]"
+                " [--rotate ANGLE]\n"
                 "  --source DEV    real webcam path or card name"
                 " (default: auto-detect)\n"
                 "  --name   NAME   virtual camera name"
-                " (default: WebCamProxy)\n",
+                " (default: WebCamProxy)\n"
+                "  --rotate ANGLE  0, 90, 180 (default), or 270\n",
                 argv[0]);
             return 0;
         default:
@@ -282,38 +296,23 @@ int main(int argc, char** argv) {
 
     print_sudo_help();
 
-    // --- Negotiate camera format (or use defaults if not present) ---
-    uint32_t width = 640, height = 480;
+    // Default camera format; negotiated on first consumer connect.
+    uint32_t cam_width = 640, cam_height = 480;
     uint32_t pixfmt = V4L2_PIX_FMT_YUYV;
-    uint32_t frame_size = width * height * 2;  // YUYV default
-    {
-        V4L2Device cam_tmp;
-        if (cam_tmp.open(cam_path.c_str(), V4L2_BUF_TYPE_VIDEO_CAPTURE)) {
-            if (cam_tmp.setFormat(pixfmt, width, height) &&
-                pixfmt == V4L2_PIX_FMT_YUYV) {
-                frame_size = cam_tmp.frameSize();
-                fprintf(stderr, "Format: YUYV %ux%u (%u bytes/frame)\n",
-                        width, height, frame_size);
-            } else {
-                fprintf(stderr, "Camera doesn't support YUYV, using"
-                        " defaults\n");
-                width = 640; height = 480;
-                pixfmt = V4L2_PIX_FMT_YUYV;
-                frame_size = width * height * 2;
-            }
-        } else {
-            fprintf(stderr, "Camera not available, using default format"
-                    " (will retry on demand)\n");
-        }
-    }
+
+    // Output dimensions depend on rotation angle
+    uint32_t out_width, out_height;
+    rotated_dims(cam_width, cam_height, opt_rotate, out_width, out_height);
+    uint32_t out_frame_size = out_width * out_height * 2;
+    fprintf(stderr, "Output: YUYV %ux%u rotate=%d (%u bytes/frame)\n",
+            out_width, out_height, opt_rotate, out_frame_size);
 
     // --- Everything below uses these initialized variables ---
     {
         V4L2Device out;
-        std::vector<uint8_t> rotated_frame(frame_size);
-        std::vector<uint8_t> blank_frame(frame_size, 0);
-        // Prepare black frame
-        for (size_t i = 0; i < frame_size; i += 4) {
+        std::vector<uint8_t> rotated_frame(out_frame_size);
+        std::vector<uint8_t> blank_frame(out_frame_size, 0);
+        for (size_t i = 0; i < out_frame_size; i += 4) {
             blank_frame[i]     = 16;
             blank_frame[i + 1] = 128;
             blank_frame[i + 2] = 16;
@@ -332,9 +331,9 @@ int main(int argc, char** argv) {
             goto out_done;
         }
         {
-            uint32_t opf = pixfmt, ow = width, oh = height;
+            uint32_t opf = pixfmt, ow = out_width, oh = out_height;
             if (!out.setFormat(opf, ow, oh) ||
-                opf != V4L2_PIX_FMT_YUYV || ow != width || oh != height) {
+                opf != V4L2_PIX_FMT_YUYV || ow != out_width || oh != out_height) {
                 fprintf(stderr, "Output device rejected format\n");
                 goto out_done;
             }
@@ -346,6 +345,21 @@ int main(int argc, char** argv) {
             ctrl.value = 1;
             ioctl(out.fd(), VIDIOC_S_CTRL, &ctrl);
         }
+
+        // Use streaming I/O for output (no write() buffer-pool bugs)
+        if (!out.initBuffers(4)) {
+            fprintf(stderr, "Failed to init output buffers\n");
+            goto out_done;
+        }
+        for (size_t i = 0; i < out.numBuffers(); i++) {
+            std::memcpy(out.buffer(i).start, blank_frame.data(),
+                        out_frame_size);
+        }
+        if (!out.startStreaming(out_frame_size)) {
+            fprintf(stderr, "Failed to start output streaming\n");
+            goto out_done;
+        }
+        // Set non-blocking so dequeueBuffer returns EAGAIN when empty
         {
             int fl = fcntl(out.fd(), F_GETFL, 0);
             fcntl(out.fd(), F_SETFL, fl | O_NONBLOCK);
@@ -379,15 +393,25 @@ int main(int argc, char** argv) {
             // --- Idle: wait for consumer ---
             fprintf(stderr, "[idle] camera closed, waiting...\n");
             if (use_inotify) {
+                time_t last_blank = 0;
                 while (running && open_count <= 1) {
                     struct pollfd pfd;
                     pfd.fd = inotify_fd;
                     pfd.events = POLLIN;
-                    int ret = poll(&pfd, 1, 1000);
-                    if (ret < 0) { if (errno == EINTR) continue; break; }
-                    if (ret == 0) {
-                        write(out.fd(), blank_frame.data(), frame_size);
-                        continue;
+                    int ret = poll(&pfd, 1, 2000);
+                    if (ret < 0) {
+                        if (errno == EINTR) continue; break;
+                    }
+                    // Refill if consumer drained a buffer
+                    time_t now = time(nullptr);
+                    if (ret == 0 || now - last_blank >= 3) {
+                        size_t idx, unused;
+                        if (out.dequeueBuffer(idx, unused)) {
+                            std::memcpy(out.buffer(idx).start,
+                                        blank_frame.data(), out_frame_size);
+                            out.enqueueBuffer(idx, out_frame_size);
+                        }
+                        last_blank = now;
                     }
                     if (pfd.revents & POLLIN) {
                         char buf[4096];
@@ -402,10 +426,14 @@ int main(int argc, char** argv) {
                      }
                  }
              } else {
-                // Fallback: periodic polling via /proc
                 while (running && !has_other_opener(out_path)) {
-                    write(out.fd(), blank_frame.data(), frame_size);
-                    usleep(1000000);
+                    size_t idx, unused;
+                    if (out.dequeueBuffer(idx, unused)) {
+                        std::memcpy(out.buffer(idx).start,
+                                    blank_frame.data(), out_frame_size);
+                        out.enqueueBuffer(idx, out_frame_size);
+                    }
+                    sleep(2);
                 }
             }
             if (!running) break;
@@ -414,117 +442,119 @@ int main(int argc, char** argv) {
             fprintf(stderr, "[active] consumer detected, opening camera...\n");
             V4L2Device cam;
             bool cam_ok = false;
-            do {
-                // If camera path is unknown, scan for it
-                std::string path = cam_path;
-                if (path.empty()) {
-                    // Re-scan for a webcam
-                    glob_t cgl;
-                    if (glob("/dev/video*", 0, nullptr, &cgl) == 0) {
-                        for (size_t i = 0; i < cgl.gl_pathc; i++) {
-                            if (cgl.gl_pathv[i] == out_path) continue;
-                            V4L2Device probe;
-                            if (probe.open(cgl.gl_pathv[i],
-                                           V4L2_BUF_TYPE_VIDEO_CAPTURE) &&
-                                probe.hasCapture() &&
-                                probe.hasStreaming() &&
-                                probe.driver().find("loopback") ==
-                                    std::string::npos) {
-                                path = cgl.gl_pathv[i];
-                                cam_path = path;
-                                fprintf(stderr, "Real webcam found: %s (%s)\n",
-                                        path.c_str(), probe.caps().card);
-                                probe.close();
-                                break;
-                            }
+
+            // Find camera path if unknown
+            std::string path = cam_path;
+            if (path.empty()) {
+                glob_t cgl;
+                if (glob("/dev/video*", 0, nullptr, &cgl) == 0) {
+                    for (size_t i = 0; i < cgl.gl_pathc; i++) {
+                        if (cgl.gl_pathv[i] == out_path) continue;
+                        V4L2Device probe;
+                        if (probe.open(cgl.gl_pathv[i],
+                                       V4L2_BUF_TYPE_VIDEO_CAPTURE) &&
+                            probe.hasCapture() && probe.hasStreaming() &&
+                            probe.driver().find("loopback") ==
+                                std::string::npos) {
+                            path = cgl.gl_pathv[i];
+                            cam_path = path;
+                            fprintf(stderr, "Real webcam: %s (%s)\n",
+                                    path.c_str(), probe.caps().card);
                             probe.close();
+                            break;
                         }
-                        globfree(&cgl);
+                        probe.close();
+                    }
+                    globfree(&cgl);
+                }
+            }
+            if (path.empty()) { fprintf(stderr, "No camera\n"); continue; }
+
+            if (!cam.open(path.c_str(),
+                          V4L2_BUF_TYPE_VIDEO_CAPTURE)) {
+                fprintf(stderr, "Failed to open camera: %s\n",
+                        strerror(errno));
+                continue;
+            }
+            usleep(300000);
+
+            // Try to set format; retry on EBUSY keeping the fd open.
+            // KTalk may be probing the real camera simultaneously;
+            // once it releases, S_FMT will succeed.
+            for (int retry = 0; running; retry++) {
+                uint32_t pf = V4L2_PIX_FMT_YUYV;
+                uint32_t w = cam_width, h = cam_height;
+                if (retry == 0) {
+                    // First try G_FMT (non-disruptive)
+                    uint32_t gpf, gw, gh;
+                    if (cam.getFormat(gpf, gw, gh) &&
+                        gpf == V4L2_PIX_FMT_YUYV &&
+                        gw == cam_width && gh == cam_height) {
+                        pf = gpf; w = gw; h = gh;
+                        goto format_ok;
                     }
                 }
-                if (path.empty()) {
-                    fprintf(stderr, "No camera found\n");
-                    break;
-                }
-
-                if (!cam.open(path.c_str(),
-                              V4L2_BUF_TYPE_VIDEO_CAPTURE)) {
-                    fprintf(stderr, "Failed to open camera %s: %s\n",
-                            path.c_str(), strerror(errno));
-                    break;
-                }
-                uint32_t pf = V4L2_PIX_FMT_YUYV;
-                uint32_t w = width, h = height;
-                if (!cam.setFormat(pf, w, h) ||
-                    pf != V4L2_PIX_FMT_YUYV) {
-                    fprintf(stderr, "Camera doesn't support YUYV\n");
-                    break;
-                }
-                // Update format if camera chose different dimensions
-                uint32_t new_fs = cam.frameSize();
-                if (w != width || h != height || new_fs != frame_size) {
-                    fprintf(stderr, "Camera resolution changed to %ux%u\n",
-                            w, h);
-                    // Try to update output device format
-                    uint32_t opf = pf, ow = w, oh = h;
-                    if (out.setFormat(opf, ow, oh) &&
-                        opf == V4L2_PIX_FMT_YUYV && ow == w && oh == h) {
-                        width = w; height = h;
-                        frame_size = new_fs;
-                        rotated_frame.resize(frame_size);
-                        blank_frame.resize(frame_size);
-                        for (size_t i = 0; i < frame_size; i += 4) {
+                if (cam.setFormat(pf, w, h) &&
+                    pf == V4L2_PIX_FMT_YUYV) {
+format_ok:
+                    if (w != cam_width || h != cam_height) {
+                        cam_width = w; cam_height = h;
+                        rotated_dims(cam_width, cam_height, opt_rotate,
+                                     out_width, out_height);
+                        out_frame_size = out_width * out_height * 2;
+                        uint32_t opf=pf, ow=out_width, oh=out_height;
+                        if (!out.setFormat(opf, ow, oh) ||
+                            opf != V4L2_PIX_FMT_YUYV ||
+                            ow != out_width || oh != out_height) {
+                            fprintf(stderr,
+                                    "Output rejected format\n");
+                            break;
+                        }
+                        rotated_frame.resize(out_frame_size);
+                        blank_frame.resize(out_frame_size);
+                        for (size_t i = 0; i < out_frame_size; i += 4) {
                             blank_frame[i]   = 16;
                             blank_frame[i+1] = 128;
                             blank_frame[i+2] = 16;
                             blank_frame[i+3] = 128;
                         }
                     }
-                }
-                if (!cam.initBuffers(4)) {
-                    fprintf(stderr, "Failed to init capture buffers\n");
+                    if (!cam.initBuffers(4)) {
+                        fprintf(stderr,
+                                "Failed to init capture buffers\n");
+                        break;
+                    }
+                    if (!cam.startStreaming()) {
+                        fprintf(stderr,
+                                "Failed to start capture\n");
+                        break;
+                    }
+                    cam_ok = true;
                     break;
                 }
-                if (!cam.startStreaming()) {
-                    fprintf(stderr, "Failed to start capture\n");
+
+                // Format failed — close the fd so KTalk can finish
+                // probing, then reopen and retry.
+                if (retry == 0)
+                    fprintf(stderr,
+                            "[active] camera busy (errno=%s),"
+                            " waiting...\n", strerror(errno));
+                cam.close();
+                sleep(3);
+                if (!cam.open(path.c_str(),
+                              V4L2_BUF_TYPE_VIDEO_CAPTURE)) {
+                    fprintf(stderr, "Failed to reopen camera: %s\n",
+                            strerror(errno));
                     break;
                 }
-                cam_ok = true;
-            } while (false);
+                usleep(300000);
+                if (retry > 0 && retry % 5 == 0)
+                    fprintf(stderr,
+                            "[active] still waiting after %d retries...\n",
+                            retry);
+            }
             if (!cam_ok) {
                 cam.close();
-                fprintf(stderr, "[active] camera unavailable, waiting...\n");
-                time_t retry_at = time(nullptr) + 3;
-                while (running && open_count > 1) {
-                    if (use_inotify) {
-                        struct pollfd pfd;
-                        pfd.fd = inotify_fd;
-                        pfd.events = POLLIN;
-                        int ret = poll(&pfd, 1, 1000);
-                        if (ret < 0) {
-                            if (errno == EINTR) continue; break;
-                        }
-                        if (ret == 0) {
-                            write(out.fd(), blank_frame.data(), frame_size);
-                        }
-                        if (pfd.revents & POLLIN) {
-                            char buf[4096];
-                            ssize_t len = read(inotify_fd, buf, sizeof(buf));
-                            for (char *p = buf; p < buf + len; ) {
-                                auto* ev = (struct inotify_event*)p;
-                                if (ev->mask & IN_OPEN)  open_count++;
-                                if (ev->mask & IN_CLOSE)  open_count--;
-                                p += sizeof(*ev) + ev->len;
-                            }
-                            if (open_count < 1) open_count = 1;
-                        }
-                    } else {
-                        write(out.fd(), blank_frame.data(), frame_size);
-                        sleep(1);
-                        if (!has_other_opener(out_path)) break;
-                    }
-                    if (time(nullptr) >= retry_at) break;
-                }
                 continue;
             }
 
@@ -605,22 +635,21 @@ int main(int argc, char** argv) {
                                     "Bad capture index %zu\n", idx);
                             break;
                         }
-                        rotate_yuyv_180(
+                        rotate_yuyv(
                             static_cast<const uint8_t*>(
                                 cam.buffer(idx).start),
-                            rotated_frame.data(), width, height);
+                            rotated_frame.data(),
+                            cam_width, cam_height, opt_rotate);
                         cap_count++;
                         cam.enqueueBuffer(idx, bytesused);
 
-                        ssize_t written = write(out.fd(),
-                                                rotated_frame.data(),
-                                                frame_size);
-                        if (written == static_cast<ssize_t>(frame_size)) {
+                        size_t oidx, unused;
+                        if (out.dequeueBuffer(oidx, unused)) {
+                            std::memcpy(out.buffer(oidx).start,
+                                        rotated_frame.data(),
+                                        out_frame_size);
+                            out.enqueueBuffer(oidx, out_frame_size);
                             out_count++;
-                        } else if (written < 0 && errno != EAGAIN) {
-                            fprintf(stderr, "Output write error: %s\n",
-                                    strerror(errno));
-                            break;
                         } else {
                             out_skip++;
                         }
@@ -635,6 +664,7 @@ int main(int argc, char** argv) {
 
             fprintf(stderr, "[active] closing camera...\n");
             cam.stopStreaming();
+            usleep(300000);  // let hardware finish stopping
             cam.close();
         }
 
