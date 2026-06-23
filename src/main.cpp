@@ -8,6 +8,7 @@
 #include <cstring>
 #include <ctime>
 #include <fcntl.h>
+#include <getopt.h>
 #include <glob.h>
 #include <poll.h>
 #include <string>
@@ -19,6 +20,9 @@
 #include <vector>
 
 static volatile sig_atomic_t running = 1;
+
+static std::string opt_source;   // --source /dev/videoN or card name
+static std::string opt_name = "WebCamProxy";  // --name
 
 static void sig_handler(int) { running = 0; }
 
@@ -87,7 +91,7 @@ static std::string create_loopback_device() {
     fprintf(stderr, "Creating new v4l2loopback device"
             " (sudo v4l2loopback-ctl add)...\n");
     std::string cmd = std::string(sudo_cmd()) +
-        " v4l2loopback-ctl add -n WebCamProxy -x 1 -b 4 2>/dev/null";
+        " v4l2loopback-ctl add -n " + opt_name + " -x 1 -b 4 2>/dev/null";
     int ret = system(cmd.c_str());
     if (ret != 0) {
         fprintf(stderr, "v4l2loopback-ctl add failed (exit %d).\n",
@@ -96,7 +100,7 @@ static std::string create_loopback_device() {
     }
     for (int attempt = 0; attempt < 10; attempt++) {
         if (attempt > 0) usleep(100000);
-        std::string dev = find_device_by_card("WebCamProxy");
+        std::string dev = find_device_by_card(opt_name.c_str());
         if (!dev.empty()) return dev;
     }
     return "";
@@ -150,7 +154,32 @@ static bool has_other_opener(const std::string& path) {
     return found;
 }
 
-int main() {
+int main(int argc, char** argv) {
+    static struct option long_opts[] = {
+        {"source", required_argument, nullptr, 's'},
+        {"name",   required_argument, nullptr, 'n'},
+        {"help",   no_argument,       nullptr, 'h'},
+        {nullptr, 0, nullptr, 0}
+    };
+    int c;
+    while ((c = getopt_long(argc, argv, "s:n:h", long_opts, nullptr)) != -1) {
+        switch (c) {
+        case 's': opt_source = optarg; break;
+        case 'n': opt_name   = optarg; break;
+        case 'h':
+            fprintf(stderr,
+                "Usage: %s [--source DEVICE] [--name NAME]\n"
+                "  --source DEV    real webcam path or card name"
+                " (default: auto-detect)\n"
+                "  --name   NAME   virtual camera name"
+                " (default: WebCamProxy)\n",
+                argv[0]);
+            return 0;
+        default:
+            return 1;
+        }
+    }
+
     if (!module_loaded() && !load_module()) return 1;
 
     // --- Find real webcam ---
@@ -160,20 +189,66 @@ int main() {
         return 1;
     }
     std::string cam_path;
-    for (size_t i = 0; i < gl.gl_pathc; i++) {
-        V4L2Device dev;
-        if (!dev.open(gl.gl_pathv[i], V4L2_BUF_TYPE_VIDEO_CAPTURE)) continue;
-        if (!dev.hasCapture() || !dev.hasStreaming()) {
-            dev.close(); continue;
+
+    if (!opt_source.empty()) {
+        // User specified a source — try as device path first, then card name
+        if (opt_source.find("/dev/") == 0) {
+            V4L2Device dev;
+            if (dev.open(opt_source.c_str(), V4L2_BUF_TYPE_VIDEO_CAPTURE) &&
+                dev.hasCapture() && dev.hasStreaming() &&
+                dev.driver().find("loopback") == std::string::npos) {
+                cam_path = opt_source;
+                fprintf(stderr, "Real webcam: %s (%s)\n",
+                        cam_path.c_str(), dev.caps().card);
+            }
+            dev.close();
         }
-        if (dev.driver().find("loopback") != std::string::npos) {
-            dev.close(); continue;
+        if (cam_path.empty()) {
+            // Search by card name
+            for (size_t i = 0; i < gl.gl_pathc; i++) {
+                V4L2Device dev;
+                if (!dev.open(gl.gl_pathv[i],
+                              V4L2_BUF_TYPE_VIDEO_CAPTURE)) continue;
+                if (!dev.hasCapture() || !dev.hasStreaming()) {
+                    dev.close(); continue;
+                }
+                if (dev.driver().find("loopback") != std::string::npos) {
+                    dev.close(); continue;
+                }
+                if (dev.card().find(opt_source) != std::string::npos) {
+                    cam_path = gl.gl_pathv[i];
+                    fprintf(stderr, "Real webcam: %s (%s)\n",
+                            cam_path.c_str(), dev.caps().card);
+                    dev.close();
+                    break;
+                }
+                dev.close();
+            }
         }
-        cam_path = gl.gl_pathv[i];
-        fprintf(stderr, "Real webcam: %s (%s)\n",
-                cam_path.c_str(), dev.caps().card);
-        dev.close();
-        break;
+        if (cam_path.empty()) {
+            fprintf(stderr, "No webcam matching --source '%s' found.\n",
+                    opt_source.c_str());
+        }
+    }
+
+    // Auto-detect if no source specified or specified source not found
+    if (cam_path.empty() && opt_source.empty()) {
+        for (size_t i = 0; i < gl.gl_pathc; i++) {
+            V4L2Device dev;
+            if (!dev.open(gl.gl_pathv[i], V4L2_BUF_TYPE_VIDEO_CAPTURE))
+                continue;
+            if (!dev.hasCapture() || !dev.hasStreaming()) {
+                dev.close(); continue;
+            }
+            if (dev.driver().find("loopback") != std::string::npos) {
+                dev.close(); continue;
+            }
+            cam_path = gl.gl_pathv[i];
+            fprintf(stderr, "Real webcam: %s (%s)\n",
+                    cam_path.c_str(), dev.caps().card);
+            dev.close();
+            break;
+        }
     }
     globfree(&gl);
     if (cam_path.empty()) {
@@ -184,10 +259,10 @@ int main() {
     // --- Find or create loopback device ---
     bool created = false;
     std::string out_path;
-    std::string stale = find_device_by_card("WebCamProxy");
+    std::string stale = find_device_by_card(opt_name.c_str());
     if (!stale.empty()) {
-        fprintf(stderr, "Removing stale WebCamProxy device: %s\n",
-                stale.c_str());
+        fprintf(stderr, "Removing stale %s device: %s\n",
+                opt_name.c_str(), stale.c_str());
         delete_loopback_device(stale);
     }
     out_path = create_loopback_device();
