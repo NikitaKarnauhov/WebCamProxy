@@ -177,8 +177,8 @@ int main() {
     }
     globfree(&gl);
     if (cam_path.empty()) {
-        fprintf(stderr, "No real webcam found.\n");
-        return 1;
+        fprintf(stderr, "No real webcam found at startup,"
+                " will retry on demand.\n");
     }
 
     // --- Find or create loopback device ---
@@ -207,27 +207,29 @@ int main() {
 
     print_sudo_help();
 
-    // --- Negotiate camera format (open/close camera briefly) ---
+    // --- Negotiate camera format (or use defaults if not present) ---
     uint32_t width = 640, height = 480;
-    uint32_t pixfmt, frame_size;
+    uint32_t pixfmt = V4L2_PIX_FMT_YUYV;
+    uint32_t frame_size = width * height * 2;  // YUYV default
     {
         V4L2Device cam_tmp;
-        if (!cam_tmp.open(cam_path.c_str(), V4L2_BUF_TYPE_VIDEO_CAPTURE)) {
-            fprintf(stderr, "Failed to probe camera: %s\n", strerror(errno));
-            goto cleanup_device;
+        if (cam_tmp.open(cam_path.c_str(), V4L2_BUF_TYPE_VIDEO_CAPTURE)) {
+            if (cam_tmp.setFormat(pixfmt, width, height) &&
+                pixfmt == V4L2_PIX_FMT_YUYV) {
+                frame_size = cam_tmp.frameSize();
+                fprintf(stderr, "Format: YUYV %ux%u (%u bytes/frame)\n",
+                        width, height, frame_size);
+            } else {
+                fprintf(stderr, "Camera doesn't support YUYV, using"
+                        " defaults\n");
+                width = 640; height = 480;
+                pixfmt = V4L2_PIX_FMT_YUYV;
+                frame_size = width * height * 2;
+            }
+        } else {
+            fprintf(stderr, "Camera not available, using default format"
+                    " (will retry on demand)\n");
         }
-        pixfmt = V4L2_PIX_FMT_YUYV;
-        if (!cam_tmp.setFormat(pixfmt, width, height)) {
-            fprintf(stderr, "Camera format negotiation failed\n");
-            goto cleanup_device;
-        }
-        if (pixfmt != V4L2_PIX_FMT_YUYV) {
-            fprintf(stderr, "Camera does not support YUYV\n");
-            goto cleanup_device;
-        }
-        frame_size = cam_tmp.frameSize();
-        fprintf(stderr, "Format: YUYV %ux%u (%u bytes/frame)\n",
-                width, height, frame_size);
     }
 
     // --- Everything below uses these initialized variables ---
@@ -338,18 +340,71 @@ int main() {
             V4L2Device cam;
             bool cam_ok = false;
             do {
-                if (!cam.open(cam_path.c_str(),
+                // If camera path is unknown, scan for it
+                std::string path = cam_path;
+                if (path.empty()) {
+                    // Re-scan for a webcam
+                    glob_t cgl;
+                    if (glob("/dev/video*", 0, nullptr, &cgl) == 0) {
+                        for (size_t i = 0; i < cgl.gl_pathc; i++) {
+                            if (cgl.gl_pathv[i] == out_path) continue;
+                            V4L2Device probe;
+                            if (probe.open(cgl.gl_pathv[i],
+                                           V4L2_BUF_TYPE_VIDEO_CAPTURE) &&
+                                probe.hasCapture() &&
+                                probe.hasStreaming() &&
+                                probe.driver().find("loopback") ==
+                                    std::string::npos) {
+                                path = cgl.gl_pathv[i];
+                                cam_path = path;
+                                fprintf(stderr, "Real webcam found: %s (%s)\n",
+                                        path.c_str(), probe.caps().card);
+                                probe.close();
+                                break;
+                            }
+                            probe.close();
+                        }
+                        globfree(&cgl);
+                    }
+                }
+                if (path.empty()) {
+                    fprintf(stderr, "No camera found\n");
+                    break;
+                }
+
+                if (!cam.open(path.c_str(),
                               V4L2_BUF_TYPE_VIDEO_CAPTURE)) {
-                    fprintf(stderr, "Failed to open camera: %s\n",
-                            strerror(errno));
+                    fprintf(stderr, "Failed to open camera %s: %s\n",
+                            path.c_str(), strerror(errno));
                     break;
                 }
                 uint32_t pf = V4L2_PIX_FMT_YUYV;
                 uint32_t w = width, h = height;
                 if (!cam.setFormat(pf, w, h) ||
                     pf != V4L2_PIX_FMT_YUYV) {
-                    fprintf(stderr, "Failed to set camera format\n");
+                    fprintf(stderr, "Camera doesn't support YUYV\n");
                     break;
+                }
+                // Update format if camera chose different dimensions
+                uint32_t new_fs = cam.frameSize();
+                if (w != width || h != height || new_fs != frame_size) {
+                    fprintf(stderr, "Camera resolution changed to %ux%u\n",
+                            w, h);
+                    // Try to update output device format
+                    uint32_t opf = pf, ow = w, oh = h;
+                    if (out.setFormat(opf, ow, oh) &&
+                        opf == V4L2_PIX_FMT_YUYV && ow == w && oh == h) {
+                        width = w; height = h;
+                        frame_size = new_fs;
+                        rotated_frame.resize(frame_size);
+                        blank_frame.resize(frame_size);
+                        for (size_t i = 0; i < frame_size; i += 4) {
+                            blank_frame[i]   = 16;
+                            blank_frame[i+1] = 128;
+                            blank_frame[i+2] = 16;
+                            blank_frame[i+3] = 128;
+                        }
+                    }
                 }
                 if (!cam.initBuffers(4)) {
                     fprintf(stderr, "Failed to init capture buffers\n");
@@ -361,7 +416,42 @@ int main() {
                 }
                 cam_ok = true;
             } while (false);
-            if (!cam_ok) { cam.close(); continue; }
+            if (!cam_ok) {
+                cam.close();
+                fprintf(stderr, "[active] camera unavailable, waiting...\n");
+                time_t retry_at = time(nullptr) + 3;
+                while (running && open_count > 1) {
+                    if (use_inotify) {
+                        struct pollfd pfd;
+                        pfd.fd = inotify_fd;
+                        pfd.events = POLLIN;
+                        int ret = poll(&pfd, 1, 1000);
+                        if (ret < 0) {
+                            if (errno == EINTR) continue; break;
+                        }
+                        if (ret == 0) {
+                            write(out.fd(), blank_frame.data(), frame_size);
+                        }
+                        if (pfd.revents & POLLIN) {
+                            char buf[4096];
+                            ssize_t len = read(inotify_fd, buf, sizeof(buf));
+                            for (char *p = buf; p < buf + len; ) {
+                                auto* ev = (struct inotify_event*)p;
+                                if (ev->mask & IN_OPEN)  open_count++;
+                                if (ev->mask & IN_CLOSE)  open_count--;
+                                p += sizeof(*ev) + ev->len;
+                            }
+                            if (open_count < 1) open_count = 1;
+                        }
+                    } else {
+                        write(out.fd(), blank_frame.data(), frame_size);
+                        sleep(1);
+                        if (!has_other_opener(out_path)) break;
+                    }
+                    if (time(nullptr) >= retry_at) break;
+                }
+                continue;
+            }
 
             fprintf(stderr, "Camera streaming to %s."
                     " Press Ctrl+C to stop.\n", out_path.c_str());
