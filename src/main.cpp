@@ -28,8 +28,52 @@ static int opt_sharpness = -1;           // -1 = not set
 static int opt_backlight = -1;
 static int opt_focus_abs = -1;
 static bool opt_focus_auto = true;       // default: auto
+static std::string opt_frame_size;       // --input-frame-size WxH
 
 static void sig_handler(int) { running = 0; }
+
+static void set_best_fps(int fd, uint32_t width, uint32_t height,
+                         uint32_t pixelformat) {
+    // Enumerate frame intervals, pick the fastest (smallest interval)
+    struct v4l2_frmivalenum fie;
+    std::memset(&fie, 0, sizeof(fie));
+    fie.pixel_format = pixelformat;
+    fie.width = width;
+    fie.height = height;
+
+    uint32_t best_num = 0, best_den = 1;
+    for (fie.index = 0;
+         ioctl(fd, VIDIOC_ENUM_FRAMEINTERVALS, &fie) >= 0;
+         fie.index++) {
+        if (fie.type == V4L2_FRMIVAL_TYPE_DISCRETE) {
+            float fps = static_cast<float>(fie.discrete.denominator) /
+                        fie.discrete.numerator;
+            float best = (best_den > 0) ?
+                static_cast<float>(best_den) / best_num : 0;
+            if (fps > best) {
+                best_num = fie.discrete.numerator;
+                best_den = fie.discrete.denominator;
+            }
+        } else if (fie.type == V4L2_FRMIVAL_TYPE_STEPWISE) {
+            // Use the minimum interval (= maximum fps)
+            best_num = fie.stepwise.min.numerator;
+            best_den = fie.stepwise.min.denominator;
+            break;
+        }
+    }
+
+    if (best_num > 0) {
+        struct v4l2_streamparm parm;
+        std::memset(&parm, 0, sizeof(parm));
+        parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        parm.parm.capture.timeperframe.numerator = best_num;
+        parm.parm.capture.timeperframe.denominator = best_den;
+        if (ioctl(fd, VIDIOC_S_PARM, &parm) == 0) {
+            float fps = static_cast<float>(best_den) / best_num;
+            fprintf(stderr, "Frame rate: %.2f fps\n", fps);
+        }
+    }
+}
 
 static void apply_controls(int fd) {
     auto set_ctrl = [fd](uint32_t id, int val, const char* name) {
@@ -192,11 +236,12 @@ int main(int argc, char** argv) {
         {"sharpness",             required_argument, nullptr, 'S'},
         {"backlight-compensation",required_argument, nullptr, 'B'},
         {"focus",                 required_argument, nullptr, 'F'},
+        {"input-frame-size",      required_argument, nullptr, 'W'},
         {"help",                  no_argument,       nullptr, 'h'},
         {nullptr, 0, nullptr, 0}
     };
     int c;
-    while ((c = getopt_long(argc, argv, "s:n:r:S:B:F:h",
+    while ((c = getopt_long(argc, argv, "s:n:r:S:B:F:W:h",
                             long_opts, nullptr)) != -1) {
         switch (c) {
         case 's': opt_source = optarg; break;
@@ -220,6 +265,7 @@ int main(int argc, char** argv) {
                 opt_focus_abs = atoi(optarg);
             }
             break;
+        case 'W': opt_frame_size = optarg; break;
         case 'h':
             fprintf(stderr,
                 "Usage: %s [OPTIONS]\n"
@@ -231,7 +277,9 @@ int main(int argc, char** argv) {
                 "  --sharpness N    set sharpness"
                 " (camera-dependent)\n"
                 "  --backlight-compensation N  set backlight comp.\n"
-                "  --focus auto|N   auto-focus or manual value\n",
+                "  --focus auto|N   auto-focus or manual value\n"
+                "  --input-frame-size WxH  capture resolution"
+                " (default: 640x480)\n",
                 argv[0]);
             return 0;
         default:
@@ -343,6 +391,17 @@ int main(int argc, char** argv) {
 
     // Default camera format; negotiated on first consumer connect.
     uint32_t cam_width = 640, cam_height = 480;
+    if (!opt_frame_size.empty()) {
+        uint32_t rw, rh;
+        if (sscanf(opt_frame_size.c_str(), "%ux%u", &rw, &rh) == 2 &&
+            rw > 0 && rh > 0) {
+            cam_width = rw; cam_height = rh;
+            fprintf(stderr, "Requested input size: %ux%u\n", rw, rh);
+        } else {
+            fprintf(stderr, "Invalid --input-frame-size '%s',"
+                    " using default\n", opt_frame_size.c_str());
+        }
+    }
     uint32_t pixfmt = V4L2_PIX_FMT_YUYV;
 
     // Output dimensions depend on rotation angle
@@ -526,15 +585,29 @@ int main(int argc, char** argv) {
             // Try to set format; retry on EBUSY keeping the fd open.
             // KTalk may be probing the real camera simultaneously;
             // once it releases, S_FMT will succeed.
+            // Parse requested frame size
+            uint32_t req_w = cam_width, req_h = cam_height;
+            if (!opt_frame_size.empty()) {
+                if (sscanf(opt_frame_size.c_str(), "%ux%u",
+                           &req_w, &req_h) != 2) {
+                    fprintf(stderr, "Invalid --input-frame-size: %s"
+                            " (expected WxH)\n",
+                            opt_frame_size.c_str());
+                    req_w = cam_width; req_h = cam_height;
+                } else {
+                    fprintf(stderr, "Requested input size: %ux%u\n",
+                            req_w, req_h);
+                }
+            }
+
             for (int retry = 0; running; retry++) {
                 uint32_t pf = V4L2_PIX_FMT_YUYV;
-                uint32_t w = cam_width, h = cam_height;
+                uint32_t w = req_w, h = req_h;
                 if (retry == 0) {
-                    // First try G_FMT (non-disruptive)
                     uint32_t gpf, gw, gh;
                     if (cam.getFormat(gpf, gw, gh) &&
                         gpf == V4L2_PIX_FMT_YUYV &&
-                        gw == cam_width && gh == cam_height) {
+                        gw == req_w && gh == req_h) {
                         pf = gpf; w = gw; h = gh;
                         goto format_ok;
                     }
@@ -555,6 +628,22 @@ format_ok:
                                     "Output rejected format\n");
                             break;
                         }
+                        // Re-allocate output buffers for new size
+                        out.stopStreaming();
+                        if (!out.initBuffers(4)) {
+                            fprintf(stderr,
+                                    "Failed to reinit output buffers\n");
+                            break;
+                        }
+                        for (size_t i = 0; i < out.numBuffers(); i++) {
+                            std::memset(out.buffer(i).start, 0,
+                                        out.buffer(i).length);
+                        }
+                        if (!out.startStreaming(out_frame_size)) {
+                            fprintf(stderr,
+                                    "Failed to restart output\n");
+                            break;
+                        }
                         rotated_frame.resize(out_frame_size);
                         blank_frame.resize(out_frame_size);
                         for (size_t i = 0; i < out_frame_size; i += 4) {
@@ -563,7 +652,15 @@ format_ok:
                             blank_frame[i+2] = 16;
                             blank_frame[i+3] = 128;
                         }
+                        // Re-seed output buffers
+                        for (size_t i = 0; i < out.numBuffers(); i++) {
+                            size_t n = out.buffer(i).length;
+                            if (n > out_frame_size) n = out_frame_size;
+                            std::memcpy(out.buffer(i).start,
+                                        blank_frame.data(), n);
+                        }
                     }
+                    set_best_fps(cam.fd(), w, h, pf);
                     if (!cam.initBuffers(4)) {
                         fprintf(stderr,
                                 "Failed to init capture buffers\n");
