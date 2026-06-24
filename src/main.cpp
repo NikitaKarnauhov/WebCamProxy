@@ -24,8 +24,36 @@ static volatile sig_atomic_t running = 1;
 static std::string opt_source;   // --source
 static std::string opt_name = "WebCamProxy";  // --name
 static int opt_rotate = 180;     // --rotate
+static int opt_sharpness = -1;           // -1 = not set
+static int opt_backlight = -1;
+static int opt_focus_abs = -1;
+static bool opt_focus_auto = true;       // default: auto
 
 static void sig_handler(int) { running = 0; }
+
+static void apply_controls(int fd) {
+    auto set_ctrl = [fd](uint32_t id, int val, const char* name) {
+        v4l2_control ctrl;
+        std::memset(&ctrl, 0, sizeof(ctrl));
+        ctrl.id = id;
+        ctrl.value = val;
+        if (ioctl(fd, VIDIOC_S_CTRL, &ctrl) < 0)
+            fprintf(stderr, "Warning: could not set %s: %s\n",
+                    name, strerror(errno));
+    };
+
+    if (opt_sharpness >= 0)
+        set_ctrl(V4L2_CID_SHARPNESS, opt_sharpness, "sharpness");
+    if (opt_backlight >= 0)
+        set_ctrl(V4L2_CID_BACKLIGHT_COMPENSATION, opt_backlight,
+                 "backlight_compensation");
+    if (opt_focus_abs >= 0) {
+        set_ctrl(V4L2_CID_FOCUS_AUTO, 0, "focus_auto");
+        set_ctrl(V4L2_CID_FOCUS_ABSOLUTE, opt_focus_abs, "focus_absolute");
+    } else if (!opt_focus_auto) {
+        set_ctrl(V4L2_CID_FOCUS_AUTO, 0, "focus_auto");
+    }
+}
 
 static bool module_loaded() {
     struct stat st;
@@ -158,14 +186,18 @@ static bool has_other_opener(const std::string& path) {
 
 int main(int argc, char** argv) {
     static struct option long_opts[] = {
-        {"source", required_argument, nullptr, 's'},
-        {"name",   required_argument, nullptr, 'n'},
-        {"rotate", required_argument, nullptr, 'r'},
-        {"help",   no_argument,       nullptr, 'h'},
+        {"source",                required_argument, nullptr, 's'},
+        {"name",                  required_argument, nullptr, 'n'},
+        {"rotate",                required_argument, nullptr, 'r'},
+        {"sharpness",             required_argument, nullptr, 'S'},
+        {"backlight-compensation",required_argument, nullptr, 'B'},
+        {"focus",                 required_argument, nullptr, 'F'},
+        {"help",                  no_argument,       nullptr, 'h'},
         {nullptr, 0, nullptr, 0}
     };
     int c;
-    while ((c = getopt_long(argc, argv, "s:n:r:h", long_opts, nullptr)) != -1) {
+    while ((c = getopt_long(argc, argv, "s:n:r:S:B:F:h",
+                            long_opts, nullptr)) != -1) {
         switch (c) {
         case 's': opt_source = optarg; break;
         case 'n': opt_name   = optarg; break;
@@ -173,20 +205,33 @@ int main(int argc, char** argv) {
             opt_rotate = atoi(optarg);
             if (opt_rotate != 0 && opt_rotate != 90 &&
                 opt_rotate != 180 && opt_rotate != 270) {
-                fprintf(stderr, "Invalid --rotate angle: %s"
+                fprintf(stderr, "Invalid --rotate: %s"
                         " (must be 0, 90, 180, or 270)\n", optarg);
                 return 1;
             }
             break;
+        case 'S': opt_sharpness = atoi(optarg); break;
+        case 'B': opt_backlight = atoi(optarg); break;
+        case 'F':
+            if (strcmp(optarg, "auto") == 0) {
+                opt_focus_auto = true;
+            } else {
+                opt_focus_auto = false;
+                opt_focus_abs = atoi(optarg);
+            }
+            break;
         case 'h':
             fprintf(stderr,
-                "Usage: %s [--source DEVICE] [--name NAME]"
-                " [--rotate ANGLE]\n"
-                "  --source DEV    real webcam path or card name"
-                " (default: auto-detect)\n"
-                "  --name   NAME   virtual camera name"
+                "Usage: %s [OPTIONS]\n"
+                "  --source DEV     real webcam path or card name"
+                " (default: auto)\n"
+                "  --name   NAME    virtual camera name"
                 " (default: WebCamProxy)\n"
-                "  --rotate ANGLE  0, 90, 180 (default), or 270\n",
+                "  --rotate ANGLE   0, 90, 180 (default), or 270\n"
+                "  --sharpness N    set sharpness"
+                " (camera-dependent)\n"
+                "  --backlight-compensation N  set backlight comp.\n"
+                "  --focus auto|N   auto-focus or manual value\n",
                 argv[0]);
             return 0;
         default:
@@ -530,6 +575,7 @@ format_ok:
                         break;
                     }
                     cam_ok = true;
+                    apply_controls(cam.fd());
                     break;
                 }
 
