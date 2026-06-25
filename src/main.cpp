@@ -31,6 +31,7 @@ static int opt_focus_abs = -1;
 static bool opt_focus_auto = true;       // default: auto
 static std::string opt_frame_size;       // --input-frame-size WxH
 static std::string opt_input_fmt;        // --input-format auto|mjpg
+static std::string opt_aspect_ratio;     // --output-aspect-ratio W:H
 
 static void sig_handler(int) { running = 0; }
 
@@ -240,11 +241,12 @@ int main(int argc, char** argv) {
         {"focus",                 required_argument, nullptr, 'F'},
         {"input-frame-size",      required_argument, nullptr, 'W'},
         {"input-format",          required_argument, nullptr, 'I'},
+        {"output-aspect-ratio",   required_argument, nullptr, 'A'},
         {"help",                  no_argument,       nullptr, 'h'},
         {nullptr, 0, nullptr, 0}
     };
     int c;
-    while ((c = getopt_long(argc, argv, "s:n:r:S:B:F:W:I:h",
+    while ((c = getopt_long(argc, argv, "s:n:r:S:B:F:W:I:A:h",
                             long_opts, nullptr)) != -1) {
         switch (c) {
         case 's': opt_source = optarg; break;
@@ -277,6 +279,7 @@ int main(int argc, char** argv) {
                 return 1;
             }
             break;
+        case 'A': opt_aspect_ratio = optarg; break;
         case 'h':
             fprintf(stderr,
                 "Usage: %s [OPTIONS]\n"
@@ -292,7 +295,9 @@ int main(int argc, char** argv) {
                 "  --input-frame-size WxH  capture resolution"
                 " (default: 640x480)\n"
                 "  --input-format auto|mjpg  capture format"
-                " (default: auto=YUYV)\n",
+                " (default: auto=YUYV)\n"
+                "  --output-aspect-ratio W:H  crop to aspect"
+                " (e.g. 4:3, 16:9)\n",
                 argv[0]);
             return 0;
         default:
@@ -418,10 +423,38 @@ int main(int argc, char** argv) {
     uint32_t pixfmt = (opt_input_fmt == "mjpg") ?
         V4L2_PIX_FMT_MJPEG : V4L2_PIX_FMT_YUYV;
 
-    // Output dimensions depend on rotation angle
+    // Output dimensions depend on rotation angle, then crop
     uint32_t out_width, out_height;
-    rotated_dims(cam_width, cam_height, opt_rotate, out_width, out_height);
-    uint32_t out_frame_size = out_width * out_height * 2;
+    {
+        uint32_t full_ow, full_oh;
+        rotated_dims(cam_width, cam_height, opt_rotate, full_ow, full_oh);
+        out_width = full_ow;
+        out_height = full_oh;
+    }
+    uint32_t out_frame_size;
+    // Crop region (0 = no crop)
+    uint32_t crop_x = 0, crop_y = 0, crop_w = 0, crop_h = 0;
+    // Output-space crop (for software pipeline); input-space in above vars
+    uint32_t ocrop_x = 0, ocrop_y = 0, ocrop_w = 0, ocrop_h = 0;
+    int aspect_num = 0, aspect_den = 0;
+    if (!opt_aspect_ratio.empty()) {
+        if (sscanf(opt_aspect_ratio.c_str(), "%d:%d",
+                   &aspect_num, &aspect_den) != 2 ||
+            aspect_num <= 0 || aspect_den <= 0) {
+            fprintf(stderr, "Invalid --output-aspect-ratio: %s"
+                    " (expected W:H, e.g. 4:3)\n",
+                    opt_aspect_ratio.c_str());
+            aspect_num = aspect_den = 0;
+        } else {
+             compute_crop(out_width, out_height, aspect_num, aspect_den,
+                          crop_x, crop_y, crop_w, crop_h);
+             ocrop_x = crop_x; ocrop_y = crop_y;
+             ocrop_w = crop_w; ocrop_h = crop_h;
+             out_width = crop_w;
+            out_height = crop_h;
+        }
+    }
+    out_frame_size = out_width * out_height * 2;
     fprintf(stderr, "Output: YUYV %ux%u rotate=%d (%u bytes/frame)\n",
             out_width, out_height, opt_rotate, out_frame_size);
 
@@ -432,6 +465,16 @@ int main(int argc, char** argv) {
         bool out_is_mjpg = cam_is_mjpg;
         std::vector<uint8_t> rotated_frame(out_frame_size);
         std::vector<uint8_t> blank_frame(out_frame_size, 0);
+        size_t raw_frame_sz = static_cast<size_t>(cam_width) *
+                              cam_height * 2;
+        // For 90/270 rotation, raw needs to hold rotated frame too
+        {
+            uint32_t rw, rh;
+            rotated_dims(cam_width, cam_height, opt_rotate, rw, rh);
+            size_t rotated_sz = static_cast<size_t>(rw) * rh * 2;
+            if (rotated_sz > raw_frame_sz) raw_frame_sz = rotated_sz;
+        }
+        std::vector<uint8_t> raw_frame(raw_frame_sz);
         for (size_t i = 0; i < out_frame_size; i += 4) {
             blank_frame[i]     = 16;
             blank_frame[i + 1] = 128;
@@ -629,32 +672,9 @@ int main(int argc, char** argv) {
                     }
                 }
                 if (cam.setFormat(pf, w, h)) {
-format_ok:
-                    uint32_t cam_fs = cam.frameSize();
-                    if (cam_fs == 0) cam_fs = w * h * 2;  // fallback
-                    bool is_mjpg = (pf == V4L2_PIX_FMT_MJPEG);
-                    uint32_t out_fs;
-                    if (is_mjpg && opt_rotate == 0) {
-                        out_width = w;
-                        out_height = h;
-                        out_frame_size = out_fs = cam_fs;
-                        fprintf(stderr, "Format: MJPG %ux%u (max %u"
-                                " bytes/frame)\n", w, h, cam_fs);
-                    } else if (is_mjpg) {
-                        // MJPEG → decode → rotate → re-encode MJPG
-                        rotated_dims(w, h, opt_rotate,
-                                     out_width, out_height);
-                        out_fs = out_width * out_height * 2;
-                        out_frame_size = out_fs;
-                        fprintf(stderr, "Format: MJPG %ux%u → MJPG"
-                                " %ux%u rotate=%d\n",
-                                w, h, out_width, out_height, opt_rotate);
-                    } else if (pf == V4L2_PIX_FMT_YUYV) {
-                        rotated_dims(w, h, opt_rotate,
-                                     out_width, out_height);
-                        out_fs = out_width * out_height * 2;
-                        out_frame_size = out_fs;
-                    } else {
+ format_ok:
+                    if (pf != V4L2_PIX_FMT_MJPEG &&
+                        pf != V4L2_PIX_FMT_YUYV) {
                         fprintf(stderr, "Unsupported format %c%c%c%c\n",
                                 static_cast<char>(pf & 0xFF),
                                 static_cast<char>((pf >> 8) & 0xFF),
@@ -662,40 +682,87 @@ format_ok:
                                 static_cast<char>((pf >> 24) & 0xFF));
                         break;
                     }
-                    if (w != cam_width || h != cam_height ||
-                        out_fs != out_frame_size ||
-                        pf != pixfmt) {
-                        cam_width = w; cam_height = h;
-                        cam_is_mjpg = (pf == V4L2_PIX_FMT_MJPEG);
-                        out_is_mjpg = cam_is_mjpg;
-                        pixfmt = out_is_mjpg ? pf : V4L2_PIX_FMT_YUYV;
+                    uint32_t full_ow, full_oh;
+                    rotated_dims(w, h, opt_rotate, full_ow, full_oh);
 
-                        // Only update output if format actually differs
-                        bool fmt_changed = true;
+                    // Output crop (after rotation) — compute fresh each time
+                    uint32_t oc_x = 0, oc_y = 0, oc_w = full_ow, oc_h = full_oh;
+                    if (aspect_num > 0) {
+                        compute_crop(full_ow, full_oh, aspect_num,
+                                     aspect_den, oc_x, oc_y, oc_w, oc_h);
+                    }
+                    out_width = oc_w;
+                    out_height = oc_h;
+
+                    uint32_t cam_fs = cam.frameSize();
+                    if (cam_fs == 0) cam_fs = w * h * 2;
+                    uint32_t out_fs = out_width * out_height * 2;
+                    out_frame_size = out_fs;
+
+                    if (oc_w != full_ow || oc_h != full_oh)
+                        fprintf(stderr, "Crop: %ux%u → %ux%u"
+                                " (output %ux%u)\n",
+                                full_ow, full_oh, oc_w, oc_h,
+                                out_width, out_height);
+                    else
+                        fprintf(stderr, "Format: %c%c%c%c %ux%u"
+                                " rotate=%d\n",
+                                static_cast<char>(pf & 0xFF),
+                                static_cast<char>((pf >> 8) & 0xFF),
+                                static_cast<char>((pf >> 16) & 0xFF),
+                                static_cast<char>((pf >> 24) & 0xFF),
+                                out_width, out_height, opt_rotate);
+                    if (w != cam_width || h != cam_height) {
+                        cam_width = w; cam_height = h;
+                        raw_frame_sz = static_cast<size_t>(cam_width) *
+                                       cam_height * 2;
                         {
-                            uint32_t cpf, cw, ch;
-                            if (out.getFormat(cpf, cw, ch) &&
-                                cpf == pixfmt &&
-                                cw == out_width && ch == out_height) {
-                                fmt_changed = false;
-                            }
+                            uint32_t rw, rh;
+                            rotated_dims(cam_width, cam_height,
+                                         opt_rotate, rw, rh);
+                            size_t rs = static_cast<size_t>(rw) * rh * 2;
+                            if (rs > raw_frame_sz) raw_frame_sz = rs;
                         }
-                        if (fmt_changed) {
-                        uint32_t opf = pixfmt, ow = out_width, oh = out_height;
-                        // Temporarily allow format change
+                        raw_frame.resize(raw_frame_sz);
+                    }
+                    cam_is_mjpg = (pf == V4L2_PIX_FMT_MJPEG);
+                    out_is_mjpg = cam_is_mjpg;
+                    // Always update crop globals (active loop needs them)
+                    ocrop_x = oc_x; ocrop_y = oc_y;
+                    ocrop_w = oc_w; ocrop_h = oc_h;
+                    crop_x = oc_x; crop_y = oc_y;
+                    crop_w = oc_w; crop_h = oc_h;
+                    pixfmt = out_is_mjpg ? pf : V4L2_PIX_FMT_YUYV;
+
+                    // Always update output if crop/format changed dims
+                    bool fmt_changed = true;
+                    {
+                        uint32_t cpf, cw, ch;
+                        if (out.getFormat(cpf, cw, ch) &&
+                            cpf == pixfmt &&
+                            cw == out_width && ch == out_height) {
+                            fmt_changed = false;
+                        }
+                    }
+                    if (fmt_changed) {
+                        out.stopStreaming();
+                        uint32_t opf = pixfmt, ow = out_width,
+                                 oh = out_height;
                         {
                             v4l2_control ctrl;
                             std::memset(&ctrl, 0, sizeof(ctrl));
                             ctrl.id = 0x0098f900;
                             ctrl.value = 0;
-                            ioctl(out.fd(), VIDIOC_S_CTRL, &ctrl);
+                            if (ioctl(out.fd(), VIDIOC_S_CTRL, &ctrl) < 0)
+                                fprintf(stderr, "keep_format clear"
+                                        " failed: %s\n", strerror(errno));
                         }
                         if (!out.setFormat(opf, ow, oh) || opf != pixfmt ||
                             ow != out_width || oh != out_height) {
                             fprintf(stderr,
                                     "Output rejected format"
                                     " (wanted %c%c%c%c %ux%u,"
-                                    " got %c%c%c%c %ux%u)\n",
+                                    " got %c%c%c%c %ux%u, errno=%s)\n",
                                     static_cast<char>(pixfmt & 0xFF),
                                     static_cast<char>((pixfmt >> 8) & 0xFF),
                                     static_cast<char>((pixfmt >> 16) & 0xFF),
@@ -705,7 +772,8 @@ format_ok:
                                     static_cast<char>((opf >> 8) & 0xFF),
                                     static_cast<char>((opf >> 16) & 0xFF),
                                     static_cast<char>((opf >> 24) & 0xFF),
-                                    ow, oh);
+                                    ow, oh,
+                                    strerror(errno));
                             break;
                         }
                         // Re-lock format
@@ -735,7 +803,6 @@ format_ok:
                             blank_frame[i+1] = 128;
                             blank_frame[i+2] = 16;
                             blank_frame[i+3] = 128;
-                        }
                         }
                     }
                     set_best_fps(cam.fd(), w, h, pf);
@@ -857,38 +924,47 @@ format_ok:
                             break;
                         }
                         if (cam_is_mjpg) {
-                            if (opt_rotate == 0) {
-                                std::memcpy(rotated_frame.data(),
-                                            cam.buffer(idx).start,
-                                            bytesused);
-                                bytesused = mjpeg_strip_app(
-                                    rotated_frame.data(), bytesused);
-                            } else {
-                                uint8_t* rjpeg = nullptr;
-                                size_t rjpeg_len = 0;
-                                if (!mjpeg_rotate(
-                                        static_cast<const uint8_t*>(
-                                            cam.buffer(idx).start),
-                                        bytesused,
-                                        &rjpeg, &rjpeg_len,
-                                        opt_rotate) || !rjpeg) {
-                                    cam.enqueueBuffer(idx, bytesused);
-                                    continue;
-                                }
-                                rjpeg_len = mjpeg_strip_app(rjpeg,
-                                                            rjpeg_len);
-                                size_t n = rjpeg_len;
-                                if (n > out_frame_size) n = out_frame_size;
-                                std::memcpy(rotated_frame.data(), rjpeg, n);
-                                bytesused = n;
-                                free(rjpeg);
+                            uint8_t* rjpeg = nullptr;
+                            size_t rjpeg_len = 0;
+                            // Use output-space crop for tjTransform
+                            uint32_t tx = ocrop_x, ty = ocrop_y,
+                                     tw = ocrop_w, th = ocrop_h;
+                            if (!mjpeg_transform(
+                                    static_cast<const uint8_t*>(
+                                        cam.buffer(idx).start),
+                                    bytesused,
+                                    &rjpeg, &rjpeg_len,
+                                    opt_rotate,
+                                    tx, ty, tw, th) || !rjpeg) {
+                                cam.enqueueBuffer(idx, bytesused);
+                                continue;
                             }
+                            rjpeg_len = mjpeg_strip_app(rjpeg, rjpeg_len);
+                            size_t n = rjpeg_len;
+                            if (n > out_frame_size) n = out_frame_size;
+                            std::memcpy(rotated_frame.data(), rjpeg, n);
+                            bytesused = n;
+                            free(rjpeg);
                         } else {
+                            uint32_t rw, rh;
+                            rotated_dims(cam_width, cam_height,
+                                         opt_rotate, rw, rh);
                             rotate_yuyv(
                                 static_cast<const uint8_t*>(
                                     cam.buffer(idx).start),
-                                rotated_frame.data(),
+                                raw_frame.data(),
                                 cam_width, cam_height, opt_rotate);
+                            if (crop_w > 0 && (crop_w != rw ||
+                                               crop_h != rh)) {
+                                yuyv_crop(raw_frame.data(), rw, rh,
+                                          ocrop_x, ocrop_y,
+                                          ocrop_w, ocrop_h,
+                                          rotated_frame.data());
+                            } else {
+                                std::memcpy(rotated_frame.data(),
+                                            raw_frame.data(),
+                                            out_frame_size);
+                            }
                         }
                         cap_count++;
                         cam.enqueueBuffer(idx, bytesused);
@@ -916,8 +992,19 @@ format_ok:
 
             fprintf(stderr, "[active] closing camera...\n");
             cam.stopStreaming();
-            usleep(300000);  // let hardware finish stopping
+            usleep(300000);
             cam.close();
+            // Restart output streaming to drain stale buffers
+            out.stopStreaming();
+            for (size_t i = 0; i < out.numBuffers(); i++) {
+                if (out_is_mjpg)
+                    std::memset(out.buffer(i).start, 0,
+                                out.buffer(i).length);
+                else
+                    std::memcpy(out.buffer(i).start, blank_frame.data(),
+                                out_frame_size);
+            }
+            out.startStreaming(out_is_mjpg ? 0 : out_frame_size);
         }
 
         fprintf(stderr, "Shutting down...\n");

@@ -13,4 +13,5 @@ add_executable(webcamproxy
 )
 
 find_library(TURBOJPEG_LIB turbojpeg REQUIRED)
-target_link_libraries(webcamproxy PRIVATE ${TURBOJPEG_LIB})
+find_package(JPEG REQUIRED)
+target_link_libraries(webcamproxy PRIVATE ${TURBOJPEG_LIB} JPEG::JPEG)
