@@ -861,6 +861,8 @@ format_ok:
                                 std::memcpy(rotated_frame.data(),
                                             cam.buffer(idx).start,
                                             bytesused);
+                                bytesused = mjpeg_strip_app(
+                                    rotated_frame.data(), bytesused);
                             } else {
                                 uint8_t* rjpeg = nullptr;
                                 size_t rjpeg_len = 0;
@@ -873,6 +875,8 @@ format_ok:
                                     cam.enqueueBuffer(idx, bytesused);
                                     continue;
                                 }
+                                rjpeg_len = mjpeg_strip_app(rjpeg,
+                                                            rjpeg_len);
                                 size_t n = rjpeg_len;
                                 if (n > out_frame_size) n = out_frame_size;
                                 std::memcpy(rotated_frame.data(), rjpeg, n);

@@ -36,7 +36,7 @@ bool mjpeg_rotate(const uint8_t* jpeg_in, size_t jpeg_len,
     tjtransform xform;
     std::memset(&xform, 0, sizeof(xform));
     xform.op = angle_to_op(angle);
-    xform.options = TJXOPT_TRIM;
+    xform.options = TJXOPT_TRIM | TJXOPT_COPYNONE;
 
     unsigned char* dst_buf = nullptr;
     unsigned long dst_size = 0;
@@ -57,4 +57,39 @@ bool mjpeg_rotate(const uint8_t* jpeg_in, size_t jpeg_len,
     *jpeg_out = dst_buf;
     *jpeg_out_len = static_cast<size_t>(dst_size);
     return true;
+}
+
+size_t mjpeg_strip_app(uint8_t* data, size_t len) {
+    // JPEG marker: FF xx, where xx != 00 and xx != FF.
+    // APP1–APP15: FF E1 – FF EF.
+    // We remove these markers, keeping everything else.
+    if (len < 2) return len;
+
+    size_t wpos = 0;  // write position
+    size_t rpos = 0;  // read position
+
+    while (rpos + 1 < len) {
+        if (data[rpos] == 0xFF && data[rpos + 1] >= 0xE1 &&
+            data[rpos + 1] <= 0xEF) {
+            // APP1–APP15 marker found — skip it entirely
+            if (rpos + 3 >= len) {
+                // Marker at end, keep remaining bytes
+                std::memmove(data + wpos, data + rpos, len - rpos);
+                wpos += len - rpos;
+                break;
+            }
+            uint16_t mlen = (static_cast<uint16_t>(data[rpos + 2]) << 8) |
+                            data[rpos + 3];
+            if (mlen < 2) mlen = 2;  // safeguard
+            rpos += 2 + mlen;
+            continue;
+        }
+        // Copy this byte to output
+        data[wpos++] = data[rpos++];
+    }
+    // Copy any remaining bytes
+    while (rpos < len)
+        data[wpos++] = data[rpos++];
+
+    return wpos;
 }
