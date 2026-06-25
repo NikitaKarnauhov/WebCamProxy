@@ -32,6 +32,11 @@ static bool opt_focus_auto = true;       // default: auto
 static std::string opt_frame_size;       // --input-frame-size WxH
 static std::string opt_input_fmt;        // --input-format auto|mjpg
 static std::string opt_aspect_ratio;     // --output-aspect-ratio W:H
+static std::string opt_brightness;       // auto or multiplier
+static std::string opt_contrast;         // auto or multiplier
+static std::string opt_saturation;       // auto or multiplier
+static std::string opt_white_balance;    // auto or temperature
+static std::string opt_exposure_comp;    // multiplier
 
 static void sig_handler(int) { running = 0; }
 
@@ -88,6 +93,38 @@ static void apply_controls(int fd) {
             fprintf(stderr, "Warning: could not set %s: %s\n",
                     name, strerror(errno));
     };
+    auto get_ctrl = [fd](uint32_t id, int& val) -> bool {
+        v4l2_control ctrl;
+        std::memset(&ctrl, 0, sizeof(ctrl));
+        ctrl.id = id;
+        if (ioctl(fd, VIDIOC_G_CTRL, &ctrl) < 0) return false;
+        val = ctrl.value;
+        return true;
+    };
+    auto get_range = [fd](uint32_t id, int& def, int& minv, int& maxv) -> bool {
+        v4l2_queryctrl qc;
+        std::memset(&qc, 0, sizeof(qc));
+        qc.id = id;
+        if (ioctl(fd, VIDIOC_QUERYCTRL, &qc) < 0) return false;
+        def = qc.default_value;
+        minv = qc.minimum;
+        maxv = qc.maximum;
+        return true;
+    };
+    auto apply_mult = [&](const std::string& opt, uint32_t cid,
+                          const char* name) {
+        if (opt.empty()) return;
+        double mult = (opt == "auto") ? 1.0 : atof(opt.c_str());
+        int def, minv, maxv;
+        if (!get_range(cid, def, minv, maxv)) {
+            fprintf(stderr, "Warning: %s control not available\n", name);
+            return;
+        }
+        int val = static_cast<int>(def * mult);
+        if (val < minv) val = minv;
+        if (val > maxv) val = maxv;
+        set_ctrl(cid, val, name);
+    };
 
     if (opt_sharpness >= 0)
         set_ctrl(V4L2_CID_SHARPNESS, opt_sharpness, "sharpness");
@@ -99,6 +136,76 @@ static void apply_controls(int fd) {
         set_ctrl(V4L2_CID_FOCUS_ABSOLUTE, opt_focus_abs, "focus_absolute");
     } else if (!opt_focus_auto) {
         set_ctrl(V4L2_CID_FOCUS_AUTO, 0, "focus_auto");
+    }
+
+    apply_mult(opt_brightness, V4L2_CID_BRIGHTNESS, "brightness");
+    apply_mult(opt_contrast,   V4L2_CID_CONTRAST,   "contrast");
+    apply_mult(opt_saturation, V4L2_CID_SATURATION,  "saturation");
+
+    if (!opt_white_balance.empty()) {
+        if (opt_white_balance == "auto") {
+            set_ctrl(V4L2_CID_AUTO_WHITE_BALANCE, 1, "auto_white_balance");
+        } else {
+            int temp = atoi(opt_white_balance.c_str());
+            int def, minv, maxv;
+            if (get_range(V4L2_CID_WHITE_BALANCE_TEMPERATURE,
+                          def, minv, maxv)) {
+                set_ctrl(V4L2_CID_AUTO_WHITE_BALANCE, 0,
+                         "auto_white_balance");
+                if (temp < minv) temp = minv;
+                if (temp > maxv) temp = maxv;
+                set_ctrl(V4L2_CID_WHITE_BALANCE_TEMPERATURE, temp,
+                         "white_balance_temperature");
+            } else {
+                fprintf(stderr,
+                        "Warning: white_balance_temperature"
+                        " not available\n");
+            }
+        }
+    }
+
+    if (!opt_exposure_comp.empty()) {
+        double mult = atof(opt_exposure_comp.c_str());
+        fprintf(stderr, "exposure-comp: mult=%.3f\n", mult);
+        if (mult == 0.0) {
+            set_ctrl(V4L2_CID_EXPOSURE_AUTO, V4L2_EXPOSURE_APERTURE_PRIORITY,
+                     "exposure_auto");
+        } else {
+            int def, minv, maxv;
+            if (!get_range(V4L2_CID_EXPOSURE_ABSOLUTE, def, minv, maxv)) {
+                fprintf(stderr, "Warning: exposure_absolute not available\n");
+                return;
+            }
+            fprintf(stderr, "exposure range: [%d, %d] default=%d\n",
+                    minv, maxv, def);
+            set_ctrl(V4L2_CID_EXPOSURE_AUTO,
+                     V4L2_EXPOSURE_APERTURE_PRIORITY, "exposure_auto");
+            // Poll until AE stabilizes
+            int cur = 0, prev;
+            for (int i = 0; i < 20; i++) {
+                usleep(100000);
+                prev = cur;
+                if (!get_ctrl(V4L2_CID_EXPOSURE_ABSOLUTE, cur)) break;
+                if (cur == prev && cur > 0) break;
+            }
+            if (cur > 0) {
+                fprintf(stderr, "AE chose exposure=%d\n", cur);
+                int val = static_cast<int>(cur * mult);
+                if (val < minv) val = minv;
+                if (val > maxv) val = maxv;
+                fprintf(stderr, "computed=%d, switching manual...\n", val);
+                set_ctrl(V4L2_CID_EXPOSURE_AUTO,
+                         V4L2_EXPOSURE_MANUAL, "exposure_auto");
+                set_ctrl(V4L2_CID_EXPOSURE_ABSOLUTE, val,
+                         "exposure_absolute");
+            } else {
+                fprintf(stderr, "could not read AE exposure\n");
+            }
+            int final_val;
+            if (get_ctrl(V4L2_CID_EXPOSURE_ABSOLUTE, final_val)) {
+                fprintf(stderr, "exposure after: %d\n", final_val);
+            }
+        }
     }
 }
 
@@ -242,12 +349,17 @@ int main(int argc, char** argv) {
         {"input-frame-size",      required_argument, nullptr, 'W'},
         {"input-format",          required_argument, nullptr, 'I'},
         {"output-aspect-ratio",   required_argument, nullptr, 'A'},
+        {"brightness",            required_argument, nullptr, 0},
+        {"contrast",              required_argument, nullptr, 0},
+        {"saturation",            required_argument, nullptr, 0},
+        {"white-balance",         required_argument, nullptr, 0},
+        {"exposure-compensation", required_argument, nullptr, 0},
         {"help",                  no_argument,       nullptr, 'h'},
         {nullptr, 0, nullptr, 0}
     };
-    int c;
+    int c, option_index;
     while ((c = getopt_long(argc, argv, "s:n:r:S:B:F:W:I:A:h",
-                            long_opts, nullptr)) != -1) {
+                            long_opts, &option_index)) != -1) {
         switch (c) {
         case 's': opt_source = optarg; break;
         case 'n': opt_name   = optarg; break;
@@ -280,6 +392,20 @@ int main(int argc, char** argv) {
             }
             break;
         case 'A': opt_aspect_ratio = optarg; break;
+        case 0:
+            if (strcmp(long_opts[option_index].name, "brightness") == 0)
+                opt_brightness = optarg;
+            else if (strcmp(long_opts[option_index].name, "contrast") == 0)
+                opt_contrast = optarg;
+            else if (strcmp(long_opts[option_index].name, "saturation") == 0)
+                opt_saturation = optarg;
+            else if (strcmp(long_opts[option_index].name,
+                            "white-balance") == 0)
+                opt_white_balance = optarg;
+            else if (strcmp(long_opts[option_index].name,
+                            "exposure-compensation") == 0)
+                opt_exposure_comp = optarg;
+            break;
         case 'h':
             fprintf(stderr,
                 "Usage: %s [OPTIONS]\n"
@@ -297,7 +423,12 @@ int main(int argc, char** argv) {
                 "  --input-format auto|mjpg  capture format"
                 " (default: auto=YUYV)\n"
                 "  --output-aspect-ratio W:H  crop to aspect"
-                " (e.g. 4:3, 16:9)\n",
+                " (e.g. 4:3, 16:9)\n"
+                "  --brightness auto|N  brightness multiplier\n"
+                "  --contrast auto|N    contrast multiplier\n"
+                "  --saturation auto|N  saturation multiplier\n"
+                "  --white-balance auto|N  auto or temperature (K)\n"
+                "  --exposure-compensation N  exposure multiplier\n",
                 argv[0]);
             return 0;
         default:
