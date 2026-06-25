@@ -9,4 +9,8 @@ add_executable(webcamproxy
     src/main.cpp
     src/v4l2.cpp
     src/rotate.cpp
+    src/mjpeg.cpp
 )
+
+find_library(TURBOJPEG_LIB turbojpeg REQUIRED)
+target_link_libraries(webcamproxy PRIVATE ${TURBOJPEG_LIB})
