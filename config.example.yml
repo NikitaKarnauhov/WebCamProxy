@@ -1,0 +1,21 @@
+# WebCamProxy configuration
+# Copy to ~/.config/WebCamProxy/config.yml or /etc/WebCamProxy/config.yml
+# CLI options override these values.
+
+#source: /dev/video2             # real webcam (path or card name substring)
+#name: WebCamProxy               # virtual camera name
+rotate: 180                       # 0, 90, 180, or 270
+#sharpness: 128                  # camera-dependent, comment out to skip
+#backlight_compensation: 1       # camera-dependent
+#focus: auto                     # "auto" or numeric value
+
+#input_frame_size: 640x480       # width x height
+#input_format: auto              # "auto" (YUYV) or "mjpg"
+
+#output_aspect_ratio: 16:9       # crop output to aspect ratio
+
+#brightness: auto                # "auto" or multiplier (e.g. 1.0, 0.5, 1.5)
+#contrast: auto
+#saturation: auto
+#white_balance: auto             # "auto" or temperature in Kelvins
+#exposure_compensation: 0        # 0 = auto aperture-priority, else multiplier

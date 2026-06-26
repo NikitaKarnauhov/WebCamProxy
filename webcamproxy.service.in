@@ -1,0 +1,11 @@
+[Unit]
+Description=WebCamProxy virtual camera
+
+[Service]
+Type=simple
+ExecStart=@CMAKE_INSTALL_FULL_BINDIR@/webcamproxy --config @CONFIG_PATH@
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
