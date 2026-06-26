@@ -1,6 +1,7 @@
 #include "v4l2.h"
 #include "rotate.h"
 #include "mjpeg.h"
+#include "config.h"
 
 #include <cerrno>
 #include <csignal>
@@ -22,21 +23,21 @@
 
 static volatile sig_atomic_t running = 1;
 
-static std::string opt_source;   // --source
-static std::string opt_name = "WebCamProxy";  // --name
-static int opt_rotate = 180;     // --rotate
-static int opt_sharpness = -1;           // -1 = not set
-static int opt_backlight = -1;
-static int opt_focus_abs = -1;
-static bool opt_focus_auto = true;       // default: auto
-static std::string opt_frame_size;       // --input-frame-size WxH
-static std::string opt_input_fmt;        // --input-format auto|mjpg
-static std::string opt_aspect_ratio;     // --output-aspect-ratio W:H
-static std::string opt_brightness;       // auto or multiplier
-static std::string opt_contrast;         // auto or multiplier
-static std::string opt_saturation;       // auto or multiplier
-static std::string opt_white_balance;    // auto or temperature
-static std::string opt_exposure_comp;    // multiplier
+std::string opt_source;   // --source
+std::string opt_name = "WebCamProxy";  // --name
+int opt_rotate = 180;     // --rotate
+int opt_sharpness = -1;           // -1 = not set
+int opt_backlight = -1;
+int opt_focus_abs = -1;
+bool opt_focus_auto = true;       // default: auto
+std::string opt_frame_size;       // --input-frame-size WxH
+std::string opt_input_fmt;        // --input-format auto|mjpg
+std::string opt_aspect_ratio;     // --output-aspect-ratio W:H
+std::string opt_brightness;       // auto or multiplier
+std::string opt_contrast;         // auto or multiplier
+std::string opt_saturation;       // auto or multiplier
+std::string opt_white_balance;    // auto or temperature
+std::string opt_exposure_comp;    // multiplier
 
 static void sig_handler(int) { running = 0; }
 
@@ -166,7 +167,6 @@ static void apply_controls(int fd) {
 
     if (!opt_exposure_comp.empty()) {
         double mult = atof(opt_exposure_comp.c_str());
-        fprintf(stderr, "exposure-comp: mult=%.3f\n", mult);
         if (mult == 0.0) {
             set_ctrl(V4L2_CID_EXPOSURE_AUTO, V4L2_EXPOSURE_APERTURE_PRIORITY,
                      "exposure_auto");
@@ -176,11 +176,8 @@ static void apply_controls(int fd) {
                 fprintf(stderr, "Warning: exposure_absolute not available\n");
                 return;
             }
-            fprintf(stderr, "exposure range: [%d, %d] default=%d\n",
-                    minv, maxv, def);
             set_ctrl(V4L2_CID_EXPOSURE_AUTO,
                      V4L2_EXPOSURE_APERTURE_PRIORITY, "exposure_auto");
-            // Poll until AE stabilizes
             int cur = 0, prev;
             for (int i = 0; i < 20; i++) {
                 usleep(100000);
@@ -189,21 +186,13 @@ static void apply_controls(int fd) {
                 if (cur == prev && cur > 0) break;
             }
             if (cur > 0) {
-                fprintf(stderr, "AE chose exposure=%d\n", cur);
                 int val = static_cast<int>(cur * mult);
                 if (val < minv) val = minv;
                 if (val > maxv) val = maxv;
-                fprintf(stderr, "computed=%d, switching manual...\n", val);
                 set_ctrl(V4L2_CID_EXPOSURE_AUTO,
                          V4L2_EXPOSURE_MANUAL, "exposure_auto");
                 set_ctrl(V4L2_CID_EXPOSURE_ABSOLUTE, val,
                          "exposure_absolute");
-            } else {
-                fprintf(stderr, "could not read AE exposure\n");
-            }
-            int final_val;
-            if (get_ctrl(V4L2_CID_EXPOSURE_ABSOLUTE, final_val)) {
-                fprintf(stderr, "exposure after: %d\n", final_val);
             }
         }
     }
@@ -354,17 +343,20 @@ int main(int argc, char** argv) {
         {"saturation",            required_argument, nullptr, 0},
         {"white-balance",         required_argument, nullptr, 0},
         {"exposure-compensation", required_argument, nullptr, 0},
+        {"config",                required_argument, nullptr, 'c'},
         {"help",                  no_argument,       nullptr, 'h'},
         {nullptr, 0, nullptr, 0}
     };
     int c, option_index;
-    while ((c = getopt_long(argc, argv, "s:n:r:S:B:F:W:I:A:h",
+    std::string config_explicit;
+    while ((c = getopt_long(argc, argv, "s:n:r:S:B:F:W:I:A:c:h",
                             long_opts, &option_index)) != -1) {
         switch (c) {
-        case 's': opt_source = optarg; break;
-        case 'n': opt_name   = optarg; break;
+        case 's': opt_source = optarg; mark_cli("source"); break;
+        case 'n': opt_name   = optarg; mark_cli("name"); break;
         case 'r':
             opt_rotate = atoi(optarg);
+            mark_cli("rotate");
             if (opt_rotate != 0 && opt_rotate != 90 &&
                 opt_rotate != 180 && opt_rotate != 270) {
                 fprintf(stderr, "Invalid --rotate: %s"
@@ -372,8 +364,10 @@ int main(int argc, char** argv) {
                 return 1;
             }
             break;
-        case 'S': opt_sharpness = atoi(optarg); break;
-        case 'B': opt_backlight = atoi(optarg); break;
+        case 'S': opt_sharpness = atoi(optarg);
+                  mark_cli("sharpness"); break;
+        case 'B': opt_backlight = atoi(optarg);
+                  mark_cli("backlight_compensation"); break;
         case 'F':
             if (strcmp(optarg, "auto") == 0) {
                 opt_focus_auto = true;
@@ -381,8 +375,10 @@ int main(int argc, char** argv) {
                 opt_focus_auto = false;
                 opt_focus_abs = atoi(optarg);
             }
+            mark_cli("focus");
             break;
-        case 'W': opt_frame_size = optarg; break;
+        case 'W': opt_frame_size = optarg;
+                  mark_cli("frame_size"); break;
         case 'I':
             opt_input_fmt = optarg;
             if (opt_input_fmt != "auto" && opt_input_fmt != "mjpg") {
@@ -390,21 +386,32 @@ int main(int argc, char** argv) {
                         " (must be 'auto' or 'mjpg')\n", optarg);
                 return 1;
             }
+            mark_cli("input_format");
             break;
-        case 'A': opt_aspect_ratio = optarg; break;
+        case 'A': opt_aspect_ratio = optarg;
+                  mark_cli("aspect_ratio"); break;
+        case 'c': config_explicit = optarg; break;
         case 0:
-            if (strcmp(long_opts[option_index].name, "brightness") == 0)
+            if (strcmp(long_opts[option_index].name, "brightness") == 0) {
                 opt_brightness = optarg;
-            else if (strcmp(long_opts[option_index].name, "contrast") == 0)
+                mark_cli("brightness");
+            } else if (strcmp(long_opts[option_index].name,
+                              "contrast") == 0) {
                 opt_contrast = optarg;
-            else if (strcmp(long_opts[option_index].name, "saturation") == 0)
+                mark_cli("contrast");
+            } else if (strcmp(long_opts[option_index].name,
+                              "saturation") == 0) {
                 opt_saturation = optarg;
-            else if (strcmp(long_opts[option_index].name,
-                            "white-balance") == 0)
+                mark_cli("saturation");
+            } else if (strcmp(long_opts[option_index].name,
+                              "white-balance") == 0) {
                 opt_white_balance = optarg;
-            else if (strcmp(long_opts[option_index].name,
-                            "exposure-compensation") == 0)
+                mark_cli("white_balance");
+            } else if (strcmp(long_opts[option_index].name,
+                              "exposure-compensation") == 0) {
                 opt_exposure_comp = optarg;
+                mark_cli("exposure_compensation");
+            }
             break;
         case 'h':
             fprintf(stderr,
@@ -435,6 +442,9 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
+
+    // Load config file (CLI options take precedence)
+    load_config(config_explicit);
 
     if (!module_loaded() && !load_module()) return 1;
 
@@ -594,6 +604,8 @@ int main(int argc, char** argv) {
         V4L2Device out;
         bool cam_is_mjpg = (pixfmt == V4L2_PIX_FMT_MJPEG);
         bool out_is_mjpg = cam_is_mjpg;
+        bool format_pending = false;  // deferred format change
+        uint32_t pending_w = 0, pending_h = 0;
         std::vector<uint8_t> rotated_frame(out_frame_size);
         std::vector<uint8_t> blank_frame(out_frame_size, 0);
         size_t raw_frame_sz = static_cast<size_t>(cam_width) *
@@ -616,8 +628,10 @@ int main(int argc, char** argv) {
         bool setup_ok = false;
         int inotify_fd = -1;
         int inotify_wd = -1;
-        int open_count = 1; // our own open
+        int open_count = 1;
         bool use_inotify = false;
+        int conf_inotify = -1;
+        int conf_inotify_wd = -1;
 
         if (!out.open(out_path.c_str(), V4L2_BUF_TYPE_VIDEO_OUTPUT)) {
             fprintf(stderr, "Failed to open output device %s: %s\n",
@@ -677,6 +691,8 @@ int main(int argc, char** argv) {
         }
         use_inotify = (inotify_fd >= 0);
 
+        conf_inotify = watch_config();
+
         signal(SIGINT, sig_handler);
         signal(SIGTERM, sig_handler);
         setvbuf(stderr, nullptr, _IONBF, 0);
@@ -686,15 +702,47 @@ int main(int argc, char** argv) {
                 " to %s...\n", out_path.c_str());
 
         while (running) {
+            // Drain config inotify events and reload if changed
+            if (conf_inotify >= 0) {
+                char cbuf[4096];
+                while (read(conf_inotify, cbuf, sizeof(cbuf)) > 0)
+                    config_changed = true;
+            }
+            if (config_changed && open_count <= 1) {
+                fprintf(stderr, "[config] reloading...\n");
+                load_config(config_explicit);
+                aspect_num = aspect_den = 0;
+                if (!opt_aspect_ratio.empty()) {
+                    sscanf(opt_aspect_ratio.c_str(), "%d:%d",
+                           &aspect_num, &aspect_den);
+                }
+                pixfmt = (opt_input_fmt == "mjpg") ?
+                    V4L2_PIX_FMT_MJPEG : V4L2_PIX_FMT_YUYV;
+                cam_is_mjpg = (pixfmt == V4L2_PIX_FMT_MJPEG);
+                out_is_mjpg = cam_is_mjpg;
+                // Force format_ok to recompute on next connect
+                cam_width = 0; cam_height = 0;
+                if (conf_inotify >= 0) close(conf_inotify);
+                conf_inotify = watch_config();
+                config_changed = false;
+            }
+
             // --- Idle: wait for consumer ---
             fprintf(stderr, "[idle] camera closed, waiting...\n");
             if (use_inotify) {
                 time_t last_blank = 0;
                 while (running && open_count <= 1) {
-                    struct pollfd pfd;
-                    pfd.fd = inotify_fd;
-                    pfd.events = POLLIN;
-                    int ret = poll(&pfd, 1, 2000);
+                    struct pollfd pfds[2];
+                    int nfds = 0;
+                    pfds[nfds].fd = inotify_fd;
+                    pfds[nfds].events = POLLIN;
+                    nfds++;
+                    if (conf_inotify >= 0) {
+                        pfds[nfds].fd = conf_inotify;
+                        pfds[nfds].events = POLLIN;
+                        nfds++;
+                    }
+                    int ret = poll(pfds, nfds, 2000);
                     if (ret < 0) {
                         if (errno == EINTR) continue; break;
                     }
@@ -711,7 +759,14 @@ int main(int argc, char** argv) {
                         }
                         last_blank = now;
                     }
-                    if (pfd.revents & POLLIN) {
+                    if (nfds > 1 && (pfds[1].revents & POLLIN)) {
+                        char cbuf[4096];
+                        while (read(conf_inotify, cbuf, sizeof(cbuf)) > 0)
+                            {}
+                        config_changed = true;
+                        break;
+                    }
+                    if (pfds[0].revents & POLLIN) {
                         char buf[4096];
                         ssize_t len = read(inotify_fd, buf, sizeof(buf));
                         for (char *p = buf; p < buf + len; ) {
@@ -731,6 +786,9 @@ int main(int argc, char** argv) {
                 }
             }
             if (!running) break;
+
+            // If we broke out due to config change, skip camera setup
+            if (config_changed) continue;
 
             // --- Consumer detected — open camera ---
             fprintf(stderr, "[active] consumer detected, opening camera...\n");
@@ -891,52 +949,48 @@ int main(int argc, char** argv) {
                         if (!out.setFormat(opf, ow, oh) || opf != pixfmt ||
                             ow != out_width || oh != out_height) {
                             fprintf(stderr,
-                                    "Output rejected format"
-                                    " (wanted %c%c%c%c %ux%u,"
-                                    " got %c%c%c%c %ux%u, errno=%s)\n",
-                                    static_cast<char>(pixfmt & 0xFF),
-                                    static_cast<char>((pixfmt >> 8) & 0xFF),
-                                    static_cast<char>((pixfmt >> 16) & 0xFF),
-                                    static_cast<char>((pixfmt >> 24) & 0xFF),
-                                    out_width, out_height,
-                                    static_cast<char>(opf & 0xFF),
-                                    static_cast<char>((opf >> 8) & 0xFF),
-                                    static_cast<char>((opf >> 16) & 0xFF),
-                                    static_cast<char>((opf >> 24) & 0xFF),
-                                    ow, oh,
-                                    strerror(errno));
-                            break;
-                        }
-                        // Re-lock format
-                        {
-                            v4l2_control ctrl;
-                            std::memset(&ctrl, 0, sizeof(ctrl));
-                            ctrl.id = 0x0098f900;
-                            ctrl.value = 1;
-                            ioctl(out.fd(), VIDIOC_S_CTRL, &ctrl);
-                        }
-                        out.stopStreaming();
-                        if (!out.initBuffers(4)) {
-                            fprintf(stderr,
-                                    "Failed to reinit output buffers\n");
-                            break;
-                        }
-        if (!out.startStreaming(pixfmt == V4L2_PIX_FMT_MJPEG ?
-                                0 : out_frame_size)) {
-                            fprintf(stderr,
-                                    "Failed to restart output\n");
-                            break;
-                        }
-                        rotated_frame.resize(out_frame_size);
-                        blank_frame.resize(out_frame_size);
-                        for (size_t i = 0; i < out_frame_size; i += 4) {
-                            blank_frame[i]   = 16;
-                            blank_frame[i+1] = 128;
-                            blank_frame[i+2] = 16;
-                            blank_frame[i+3] = 128;
+                                    "Output format change deferred"
+                                    " (errno=%s)\n", strerror(errno));
+                            format_pending = true;
+                            pending_w = out_width;
+                            pending_h = out_height;
+                            uint32_t cpf, cw, ch;
+                            if (out.getFormat(cpf, cw, ch)) {
+                                out_width = cw;
+                                out_height = ch;
+                            }
+                        } else {
+                            // Re-lock format
+                            {
+                                v4l2_control ctrl;
+                                std::memset(&ctrl, 0, sizeof(ctrl));
+                                ctrl.id = 0x0098f900;
+                                ctrl.value = 1;
+                                ioctl(out.fd(), VIDIOC_S_CTRL, &ctrl);
+                            }
+                            out.stopStreaming();
+                            if (!out.initBuffers(4)) {
+                                fprintf(stderr,
+                                        "Failed to reinit output buffers\n");
+                                break;
+                            }
+                            if (!out.startStreaming(pixfmt ==
+                                    V4L2_PIX_FMT_MJPEG ?
+                                    0 : out_frame_size)) {
+                                fprintf(stderr,
+                                        "Failed to restart output\n");
+                                break;
+                            }
+                            rotated_frame.resize(out_frame_size);
+                            blank_frame.resize(out_frame_size);
+                            for (size_t i = 0; i < out_frame_size; i += 4) {
+                                blank_frame[i]   = 16;
+                                blank_frame[i+1] = 128;
+                                blank_frame[i+2] = 16;
+                                blank_frame[i+3] = 128;
+                            }
                         }
                     }
-                    set_best_fps(cam.fd(), w, h, pf);
                     if (!cam.initBuffers(4)) {
                         fprintf(stderr,
                                 "Failed to init capture buffers\n");
@@ -1125,6 +1179,38 @@ int main(int argc, char** argv) {
             cam.stopStreaming();
             usleep(300000);
             cam.close();
+            // Apply pending format change now that consumer is gone
+            if (format_pending) {
+                fprintf(stderr, "[active] applying deferred format"
+                        " change %ux%u\n", pending_w, pending_h);
+                uint32_t opf = pixfmt, ow = pending_w, oh = pending_h;
+                {
+                    v4l2_control ctrl;
+                    std::memset(&ctrl, 0, sizeof(ctrl));
+                    ctrl.id = 0x0098f900;
+                    ctrl.value = 0;
+                    ioctl(out.fd(), VIDIOC_S_CTRL, &ctrl);
+                }
+                out.setFormat(opf, ow, oh);
+                {
+                    v4l2_control ctrl;
+                    std::memset(&ctrl, 0, sizeof(ctrl));
+                    ctrl.id = 0x0098f900;
+                    ctrl.value = 1;
+                    ioctl(out.fd(), VIDIOC_S_CTRL, &ctrl);
+                }
+                out_width = ow; out_height = oh;
+                out_frame_size = out_width * out_height * 2;
+                rotated_frame.resize(out_frame_size);
+                blank_frame.resize(out_frame_size);
+                for (size_t i = 0; i < out_frame_size; i += 4) {
+                    blank_frame[i]   = 16;
+                    blank_frame[i+1] = 128;
+                    blank_frame[i+2] = 16;
+                    blank_frame[i+3] = 128;
+                }
+                format_pending = false;
+            }
             // Restart output streaming to drain stale buffers
             out.stopStreaming();
             for (size_t i = 0; i < out.numBuffers(); i++) {
@@ -1142,6 +1228,7 @@ int main(int argc, char** argv) {
     out_done:
         if (inotify_wd >= 0) inotify_rm_watch(inotify_fd, inotify_wd);
         if (inotify_fd >= 0) close(inotify_fd);
+        if (conf_inotify >= 0) close(conf_inotify);
         out.close();
         (void)setup_ok;
     }
