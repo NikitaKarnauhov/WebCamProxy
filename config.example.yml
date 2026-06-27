@@ -11,6 +11,7 @@ rotate: 180                       # 0, 90, 180, or 270
 
 #input_frame_size: 640x480       # width x height
 #input_format: auto              # "auto" (YUYV) or "mjpg"
+#output_format: auto             # "auto", "mjpg", or "yuyv"
 
 #output_aspect_ratio: 16:9       # crop output to aspect ratio
 

@@ -68,6 +68,10 @@ Optional YAML config file, searched in order:
 CLI options override config values. The config file is watched with inotify;
 changes take effect after the current client disconnects.
 
+**Note:** Changes to `rotate`, `input_frame_size`, `input_format`,
+`output_format`, or `output_aspect_ratio` affect the output video format.
+These require a program restart to take effect.
+
 Example (`config.example.yml`):
 
 ```yaml

@@ -132,6 +132,85 @@ static void soft_error_exit(j_common_ptr c) {
     longjmp(e->jb, 1);
 }
 
+bool mjpeg_to_yuyv(const uint8_t* jpeg_in, size_t jpeg_len,
+                   uint8_t* yuyv_out, uint32_t width, uint32_t height) {
+    struct jpeg_decompress_struct cinfo;
+    struct soft_err_mgr jerr;
+    cinfo.err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit = soft_error_exit;
+    if (setjmp(jerr.jb)) { jpeg_destroy_decompress(&cinfo); return false; }
+    jpeg_create_decompress(&cinfo);
+    jpeg_mem_src(&cinfo, jpeg_in, jpeg_len);
+    jpeg_read_header(&cinfo, TRUE);
+    cinfo.out_color_space = JCS_RGB;
+    jpeg_start_decompress(&cinfo);
+    if (cinfo.output_width != width || cinfo.output_height != height)
+        { jpeg_destroy_decompress(&cinfo); return false; }
+    std::vector<uint8_t> rgb_row(width * 3);
+    for (uint32_t y = 0; y < height; y++) {
+        JSAMPROW rp = rgb_row.data();
+        jpeg_read_scanlines(&cinfo, &rp, 1);
+        // RGB → YUYV conversion (same as rgb_row_to_yuyv from soft pipeline)
+        uint8_t* dline = yuyv_out + y * width * 2;
+        for (uint32_t x = 0; x < width; x += 2) {
+            int r0=rgb_row[x*3+0], g0=rgb_row[x*3+1], b0=rgb_row[x*3+2];
+            int r1=rgb_row[x*3+3], g1=rgb_row[x*3+4], b1=rgb_row[x*3+5];
+            auto Y  = [](int r,int g,int b){ return (66*r+129*g+25*b+128)>>8; };
+            auto Cb = [](int r,int g,int b){ return ((-38*r-74*g+112*b+128)>>8)+128; };
+            auto Cr = [](int r,int g,int b){ return ((112*r-94*g-18*b+128)>>8)+128; };
+            dline[x*2+0] = Y(r0,g0,b0);
+            dline[x*2+1] = Cb((r0+r1)/2,(g0+g1)/2,(b0+b1)/2);
+            dline[x*2+2] = Y(r1,g1,b1);
+            dline[x*2+3] = Cr((r0+r1)/2,(g0+g1)/2,(b0+b1)/2);
+        }
+    }
+    jpeg_finish_decompress(&cinfo);
+    jpeg_destroy_decompress(&cinfo);
+    return true;
+}
+
+size_t yuyv_to_mjpeg(const uint8_t* yuyv, uint8_t* jpeg_out,
+                     size_t jpeg_cap, uint32_t width, uint32_t height,
+                     int quality) {
+    struct jpeg_compress_struct cinfo;
+    struct soft_err_mgr jerr;
+    cinfo.err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit = soft_error_exit;
+    if (setjmp(jerr.jb)) { jpeg_destroy_compress(&cinfo); return 0; }
+    jpeg_create_compress(&cinfo);
+    cinfo.image_width = width;
+    cinfo.image_height = height;
+    cinfo.input_components = 3;
+    cinfo.in_color_space = JCS_RGB;
+    jpeg_set_defaults(&cinfo);
+    jpeg_set_quality(&cinfo, quality, TRUE);
+    unsigned long jsz = jpeg_cap;
+    jpeg_mem_dest(&cinfo, &jpeg_out, &jsz);
+    jpeg_start_compress(&cinfo, TRUE);
+    std::vector<uint8_t> rgb_row(width * 3);
+    for (uint32_t y = 0; y < height; y++) {
+        const uint8_t* yline = yuyv + y * width * 2;
+        for (uint32_t x = 0; x < width; x += 2) {
+            int y0=yline[x*2], u=yline[x*2+1]-128,
+                y1=yline[x*2+2], v=yline[x*2+3]-128;
+            auto clip=[&](int v){ return v<0?0:(v>255?255:v); };
+            rgb_row[x*3+0]=clip(y0+((1436*v)>>10));
+            rgb_row[x*3+1]=clip(y0-((352*u)>>10)-((731*v)>>10));
+            rgb_row[x*3+2]=clip(y0+((1814*u)>>10));
+            rgb_row[x*3+3]=clip(y1+((1436*v)>>10));
+            rgb_row[x*3+4]=clip(y1-((352*u)>>10)-((731*v)>>10));
+            rgb_row[x*3+5]=clip(y1+((1814*u)>>10));
+        }
+        JSAMPROW rp = rgb_row.data();
+        jpeg_write_scanlines(&cinfo, &rp, 1);
+    }
+    jpeg_finish_compress(&cinfo);
+    jpeg_destroy_compress(&cinfo);
+    return jsz;
+}
+
+// ── Software MJPEG pipeline (decode → rotate → crop → re‑encode) ──
+
 // RGB → YUYV conversion (same as before)
 static void rgb_row_to_yuyv(const uint8_t* rgb, uint8_t* yuyv,
                             uint32_t w) {

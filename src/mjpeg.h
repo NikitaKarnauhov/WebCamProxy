@@ -2,6 +2,15 @@
 #include <cstdint>
 #include <cstddef>
 
+// Decode MJPEG to YUYV.  Returns true on success.
+bool mjpeg_to_yuyv(const uint8_t* jpeg_in, size_t jpeg_len,
+                   uint8_t* yuyv_out, uint32_t width, uint32_t height);
+
+// Encode YUYV to MJPEG.  Returns JPEG size, 0 on failure.
+size_t yuyv_to_mjpeg(const uint8_t* yuyv, uint8_t* jpeg_out,
+                     size_t jpeg_cap, uint32_t width, uint32_t height,
+                     int quality);
+
 bool mjpeg_rotate(const uint8_t* jpeg_in, size_t jpeg_len,
                   uint8_t** jpeg_out, size_t* jpeg_out_len, int angle);
 

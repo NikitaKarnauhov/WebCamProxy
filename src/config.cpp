@@ -20,6 +20,7 @@ static bool cli_backlight = false;
 static bool cli_focus = false;
 static bool cli_frame_size = false;
 static bool cli_input_fmt = false;
+static bool cli_output_fmt = false;
 static bool cli_aspect = false;
 static bool cli_brightness = false;
 static bool cli_contrast = false;
@@ -37,6 +38,7 @@ extern int opt_focus_abs;
 extern bool opt_focus_auto;
 extern std::string opt_frame_size;
 extern std::string opt_input_fmt;
+extern std::string opt_output_fmt;
 extern std::string opt_aspect_ratio;
 extern std::string opt_brightness;
 extern std::string opt_contrast;
@@ -54,6 +56,7 @@ void mark_cli(const char* name) {
     else if (strcmp(name, "focus") == 0) cli_focus = true;
     else if (strcmp(name, "frame_size") == 0) cli_frame_size = true;
     else if (strcmp(name, "input_format") == 0) cli_input_fmt = true;
+    else if (strcmp(name, "output_format") == 0) cli_output_fmt = true;
     else if (strcmp(name, "aspect_ratio") == 0) cli_aspect = true;
     else if (strcmp(name, "brightness") == 0) cli_brightness = true;
     else if (strcmp(name, "contrast") == 0) cli_contrast = true;
@@ -125,6 +128,7 @@ bool load_config(const std::string& explicit_path) {
         set_if_not_cli(opt_frame_size, root, "input_frame_size",
                        cli_frame_size);
         set_if_not_cli(opt_input_fmt, root, "input_format", cli_input_fmt);
+        set_if_not_cli(opt_output_fmt, root, "output_format", cli_output_fmt);
         set_if_not_cli(opt_aspect_ratio, root, "output_aspect_ratio",
                        cli_aspect);
         set_if_not_cli(opt_brightness, root, "brightness", cli_brightness);
